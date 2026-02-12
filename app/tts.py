@@ -165,8 +165,8 @@ class TTSClient:
                 async for chunk in text_iter:
                     if cancel_event.is_set():
                         break
-                    await loop.run_in_executor(None, lambda c=chunk: text_queue.put(c))
-                await loop.run_in_executor(None, lambda: text_queue.put(None))
+                    text_queue.put(chunk)
+                text_queue.put(None)
             except asyncio.CancelledError:
                 text_queue.put(None)
 

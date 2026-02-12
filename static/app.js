@@ -67,11 +67,17 @@ let sourceNode = null;
 
 let pendingUserBubble = null;
 let pendingAgentBubble = null;
-let sentAudioChunks = 0;
-let recvAudioChunks = 0;
 let lastFinalAsrText = "";
 let lastFinalAsrAt = 0;
 let activeTurnId = null;
+let currentState = "idle";
+
+// ---- Natural interrupt (ASR-stable based) ----
+const AUTO_INTERRUPT_ENABLED = true;
+const AUTO_INTERRUPT_MIN_FINAL_CHARS = 3; // balanced sensitivity
+const AUTO_INTERRUPT_COOLDOWN_MS = 1500; // avoid repeated interrupts from duplicate finals
+let lastAutoInterruptAt = 0;
+let lastAutoInterruptText = "";
 
 let wsConnectedAt = 0;
 let sessionStartedAt = 0;
@@ -80,8 +86,9 @@ let tickTimer = null;
 let liveTurn = { llmTokens: 0, llmRate: 0, ttsChunks: 0, ttsDurationMs: 0, listeningMs: 0, toolCalls: 0 };
 let sessionStats = { turns: 0, sumE2E: 0, totalTokens: 0, totalTtsMs: 0, totalToolCalls: 0 };
 let currentSkills = [];
-let toolLogEntries = [];
-let activeToolBubbles = {};
+let toolItemsById = {};
+let turnToolGroups = {};
+const TOOL_UI_DEBUG = false;
 
 // ---- Bubble helpers ----
 function addBubble(role, text) {
@@ -93,45 +100,138 @@ function addBubble(role, text) {
   return div;
 }
 
-function addToolBubble(toolCallId, name, args) {
-  const div = document.createElement("div");
-  div.className = "bubble tool";
-  const argsStr = typeof args === "object" ? Object.entries(args).map(([k, v]) => `${k}: ${typeof v === "string" ? v : JSON.stringify(v)}`).join(", ") : String(args);
-  div.innerHTML = `
-    <div class="tool-header">
-      <div class="tool-spinner"></div>
-      <span>${name}</span>
-      <span class="tool-time">执行中...</span>
-    </div>
-    <div class="tool-args" style="font-size:11px;color:#64748b;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${argsStr}</div>
-  `;
-  chatEl.appendChild(div);
-  chatEl.scrollTop = chatEl.scrollHeight;
-  activeToolBubbles[toolCallId] = div;
-  return div;
+function _getToolKeyArg(name, args) {
+  if (!args || typeof args !== "object") return "";
+  // Show the most meaningful arg for common tools
+  if (args.query) return args.query;
+  if (args.path) return args.path;
+  if (args.expression) return args.expression;
+  if (args.url) return args.url;
+  if (args.skill_name) return args.skill_name;
+  if (args.code) return args.code.length > 40 ? args.code.slice(0, 40) + "…" : args.code;
+  const vals = Object.values(args);
+  if (vals.length === 1 && typeof vals[0] === "string") return vals[0];
+  return "";
 }
 
-function updateToolBubble(toolCallId, content, isError, elapsedMs) {
-  const div = activeToolBubbles[toolCallId];
-  if (!div) return;
-  // Remove spinner
-  const spinner = div.querySelector(".tool-spinner");
-  if (spinner) spinner.remove();
-  // Update time
-  const timeEl = div.querySelector(".tool-time");
-  if (timeEl) timeEl.textContent = `${elapsedMs}ms`;
-  // Add result
-  const resultDiv = document.createElement("div");
-  resultDiv.className = `tool-result ${isError ? "error" : ""}`;
-  const maxLen = 150;
-  const short = content.length > maxLen ? content.slice(0, maxLen) + "..." : content;
-  resultDiv.textContent = isError ? `错误: ${short}` : short;
-  div.appendChild(resultDiv);
-  // Mark done
-  const header = div.querySelector(".tool-header span:not(.tool-time)");
-  if (header && !isError) header.classList.add("tool-done");
+function _resolveToolBubbleKey(msg) {
+  if (msg && typeof msg.tool_call_id === "string" && msg.tool_call_id.trim()) {
+    return msg.tool_call_id.trim();
+  }
+  const turnId = msg?.turn_id || "unknown_turn";
+  const name = msg?.name || "unknown_tool";
+  return `${turnId}_${name}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function _normalizeToolName(name) {
+  if (typeof name === "string" && name.trim()) return name.trim();
+  return "unknown_tool";
+}
+
+const _checkSvg = `<svg viewBox="0 0 16 16" fill="none"><path d="M3 8.5l3.5 3.5 6.5-7" stroke="#059669" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+const _errorSvg = `<svg viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="5.5" stroke="#dc2626" stroke-width="1.5"/><path d="M6 6l4 4M10 6l-4 4" stroke="#dc2626" stroke-width="1.5" stroke-linecap="round"/></svg>`;
+
+function _toolDebugLog(event, data) {
+  if (!TOOL_UI_DEBUG) return;
+  console.debug(`[tinyagent][tool-ui] ${event}`, data);
+}
+
+function _ensureToolGroupForTurn(turnId) {
+  const normalizedTurnId =
+    typeof turnId === "string" && turnId.trim() ? turnId.trim() : "unknown_turn";
+  const existing = turnToolGroups[normalizedTurnId];
+  if (existing && existing.isConnected) return existing;
+
+  const group = document.createElement("div");
+  group.className = "tool-group";
+  group.dataset.turnId = normalizedTurnId;
+  chatEl.appendChild(group);
+  turnToolGroups[normalizedTurnId] = group;
+  _toolDebugLog("ensure-turn-group", { turnId: normalizedTurnId });
+  return group;
+}
+
+function addToolBubble(toolCallId, turnId, name, args) {
+  const toolId = typeof toolCallId === "string" && toolCallId.trim()
+    ? toolCallId.trim()
+    : _resolveToolBubbleKey({ turn_id: turnId, name });
+  const existing = toolItemsById[toolId];
+  if (existing && existing.isConnected) return existing;
+
+  const group = _ensureToolGroupForTurn(turnId);
+  const item = document.createElement("div");
+  item.className = "tool-item";
+  item.dataset.toolId = toolId;
+  item.dataset.turnId = turnId || "unknown_turn";
+
+  const keyArg = _getToolKeyArg(name, args);
+  const argHtml = keyArg ? `<span class="tool-item-arg">${keyArg}</span>` : "";
+
+  item.innerHTML = `
+    <div class="tool-item-header">
+      <span class="tool-item-icon"><span class="tool-spinner"></span></span>
+      <span class="tool-item-name">${name}</span>
+      ${argHtml}
+      <span class="tool-item-time"></span>
+    </div>
+    <div class="tool-item-detail"></div>
+  `;
+  group.appendChild(item);
   chatEl.scrollTop = chatEl.scrollHeight;
-  delete activeToolBubbles[toolCallId];
+  toolItemsById[toolId] = item;
+  _toolDebugLog("tool-start", {
+    turnId: turnId || "unknown_turn",
+    toolId,
+    name,
+  });
+  return item;
+}
+
+function updateToolBubble(toolCallId, turnId, name, content, isError, elapsedMs) {
+  const toolId = typeof toolCallId === "string" && toolCallId.trim()
+    ? toolCallId.trim()
+    : _resolveToolBubbleKey({ turn_id: turnId, name });
+  let item = toolItemsById[toolId];
+  const matched = Boolean(item);
+  if (!item) {
+    // If start/result pairing is lost, still render a completed item in that turn.
+    item = addToolBubble(toolId, turnId, _normalizeToolName(name), {});
+    _toolDebugLog("tool-result-fallback-create", {
+      turnId: turnId || "unknown_turn",
+      toolId,
+      name,
+    });
+  }
+
+  // Replace spinner with icon
+  const iconEl = item.querySelector(".tool-item-icon");
+  if (iconEl) iconEl.innerHTML = isError ? _errorSvg : _checkSvg;
+
+  // Update name style
+  const nameEl = item.querySelector(".tool-item-name");
+  if (nameEl) nameEl.classList.add(isError ? "error" : "done");
+
+  // Set time
+  const timeEl = item.querySelector(".tool-item-time");
+  if (timeEl) timeEl.textContent = `${elapsedMs}ms`;
+
+  // Set expandable detail
+  const detail = item.querySelector(".tool-item-detail");
+  if (detail) {
+    if (isError) detail.classList.add("error");
+    const text = typeof content === "string" ? content.trim() : String(content ?? "");
+    detail.textContent = text || "（无返回内容）";
+  }
+  item.classList.add("expanded", "has-detail");
+
+  chatEl.scrollTop = chatEl.scrollHeight;
+  delete toolItemsById[toolId];
+  _toolDebugLog("tool-result", {
+    turnId: turnId || "unknown_turn",
+    toolId,
+    matched,
+    isError: Boolean(isError),
+  });
 }
 
 function addSkillChangeBubble(action, name) {
@@ -178,18 +278,6 @@ function setConnBadge(el, status, detail = "") {
   const shortDetail =
     detail && detail.length > maxLen ? `${detail.slice(0, maxLen - 1)}…` : detail;
   el.textContent = shortDetail ? `${status}: ${shortDetail}` : status || "unknown";
-}
-
-function maskUrl(url) {
-  if (!url || typeof url !== "string") return "-";
-  try {
-    const u = new URL(url);
-    const host = u.hostname || "unknown";
-    const path = u.pathname && u.pathname !== "/" ? u.pathname : "";
-    return `${u.protocol}//${host}${path}`;
-  } catch {
-    return url;
-  }
 }
 
 // ---- Stage Bar ----
@@ -266,14 +354,38 @@ function resetLiveTurn() {
 }
 
 function updateState(state) {
+  currentState = state;
   stateText.textContent = state;
   stateDot.className = `state-dot ${state}`;
   if (state === "listening") {
     listeningStartedAt = Date.now();
+    // New turn starts from listening; clear dedupe key.
+    lastAutoInterruptText = "";
   }
   if (state === "thinking") {
     resetLiveTurn();
   }
+}
+
+function maybeAutoInterruptFromAsr(text, isFinal) {
+  if (!AUTO_INTERRUPT_ENABLED) return false;
+  if (!isFinal) return false;
+  if (!(currentState === "speaking" || currentState === "executing")) return false;
+  if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+
+  const normalized = text.trim();
+  if (!normalized) return false;
+  const visibleChars = normalized.replace(/\s+/g, "").length;
+  if (visibleChars < AUTO_INTERRUPT_MIN_FINAL_CHARS) return false;
+
+  const now = Date.now();
+  if (now - lastAutoInterruptAt < AUTO_INTERRUPT_COOLDOWN_MS) return false;
+  if (normalized === lastAutoInterruptText) return false;
+
+  ws.send(JSON.stringify({ type: "interrupt" }));
+  lastAutoInterruptAt = now;
+  lastAutoInterruptText = normalized;
+  return true;
 }
 
 // ---- Skills Panel ----
@@ -321,16 +433,13 @@ function renderSoulInfo(soul) {
 
 // ---- Tool Log ----
 function addToolLogEntry(name, isError, content, elapsedMs) {
-  if (toolLogEntries.length === 0) {
+  if (toolLog.children.length === 1 && toolLog.firstElementChild?.classList.contains("text-slate-400")) {
     toolLog.innerHTML = "";
   }
-  const entry = { name, isError, content, elapsedMs, time: new Date() };
-  toolLogEntries.push(entry);
-  if (toolLogEntries.length > 20) toolLogEntries.shift();
 
   const div = document.createElement("div");
   div.className = `tool-log-entry ${isError ? "error" : ""}`;
-  const maxLen = 60;
+  const maxLen = 240;
   const short = content.length > maxLen ? content.slice(0, maxLen) + "..." : content;
   div.innerHTML = `
     <div class="tool-log-body">
@@ -340,6 +449,9 @@ function addToolLogEntry(name, isError, content, elapsedMs) {
     </div>
   `;
   toolLog.appendChild(div);
+  while (toolLog.children.length > 20) {
+    toolLog.removeChild(toolLog.firstElementChild);
+  }
   toolLog.scrollTop = toolLog.scrollHeight;
 }
 
@@ -410,6 +522,12 @@ class PlaybackProcessor extends AudioWorkletProcessor {
     this.current = null;
     this.offset = 0;
     this.port.onmessage = (event) => {
+      if (event.data === "clear") {
+        this.queue = [];
+        this.current = null;
+        this.offset = 0;
+        return;
+      }
       const arr = event.data;
       if (arr && arr.length) {
         this.queue.push(arr);
@@ -420,7 +538,6 @@ class PlaybackProcessor extends AudioWorkletProcessor {
   process(inputs, outputs) {
     const output = outputs[0];
     const left = output[0];
-    const right = output[1] || left;
     for (let i = 0; i < left.length; i++) {
       if (!this.current || this.offset >= this.current.length) {
         this.current = this.queue.shift() || null;
@@ -428,7 +545,6 @@ class PlaybackProcessor extends AudioWorkletProcessor {
       }
       const sample = this.current ? this.current[this.offset++] : 0;
       left[i] = sample;
-      right[i] = sample;
     }
     return true;
   }
@@ -450,7 +566,7 @@ async function initAudio() {
   playbackNode = new AudioWorkletNode(audioCtx, "playback-processor", {
     numberOfInputs: 0,
     numberOfOutputs: 1,
-    outputChannelCount: [2],
+    outputChannelCount: [1],
   });
   playbackNode.connect(audioCtx.destination);
 
@@ -478,10 +594,6 @@ async function initAudio() {
       return;
     }
     if (ws && ws.readyState === WebSocket.OPEN && data instanceof ArrayBuffer) {
-      sentAudioChunks += 1;
-      if (sentAudioChunks % 50 === 0) {
-        console.info("[tinyagent] sent mic audio chunks:", sentAudioChunks);
-      }
       ws.send(data);
     }
   };
@@ -491,7 +603,11 @@ async function initAudio() {
 function handleServerMessage(msg) {
   if (msg.type === "state") {
     updateState(msg.state);
-    if (msg.state !== "speaking") pendingAgentBubble = null;
+    if (msg.state !== "speaking") {
+      pendingAgentBubble = null;
+      // Flush any buffered TTS audio so interrupted speech stops immediately.
+      if (playbackNode) playbackNode.port.postMessage("clear");
+    }
     if (msg.state !== "listening") pendingUserBubble = null;
     if (msg.state === "idle") {
       lastFinalAsrText = "";
@@ -507,9 +623,9 @@ function handleServerMessage(msg) {
     cfgLlmModel.textContent = msg.llm_model || "-";
     cfgTtsModel.textContent = msg.tts_model || "-";
     cfgTtsVoice.textContent = msg.tts_voice || "-";
-    cfgLlmBaseUrl.textContent = maskUrl(msg.llm_base_url);
-    cfgSonioxWsUrl.textContent = maskUrl(msg.soniox_ws_url);
-    cfgTtsWsUrl.textContent = maskUrl(msg.tts_ws_url);
+    cfgLlmBaseUrl.textContent = msg.llm_base_url || "-";
+    cfgSonioxWsUrl.textContent = msg.soniox_ws_url || "-";
+    cfgTtsWsUrl.textContent = msg.tts_ws_url || "-";
     cfgAsrReady.textContent = msg.asr_configured ? "ready" : "missing";
     cfgLlmReady.textContent = msg.llm_configured ? "ready" : "missing";
     cfgTtsReady.textContent = msg.tts_configured ? "ready" : "missing";
@@ -552,16 +668,22 @@ function handleServerMessage(msg) {
     if (msg.event === "start") {
       liveTurn.toolCalls += 1;
       renderLiveTurn();
-      addToolBubble(msg.turn_id + "_" + msg.name, msg.name, msg.arguments || {});
+      const toolKey = _resolveToolBubbleKey(msg);
+      const toolName = _normalizeToolName(msg.name);
+      addToolBubble(toolKey, msg.turn_id || "unknown_turn", toolName, msg.arguments || {});
     }
     if (msg.event === "result") {
+      const toolKey = _resolveToolBubbleKey(msg);
+      const toolName = _normalizeToolName(msg.name);
       updateToolBubble(
-        msg.turn_id + "_" + msg.name,
+        toolKey,
+        msg.turn_id || "unknown_turn",
+        toolName,
         msg.content || "",
         msg.is_error || false,
         msg.elapsed_ms || 0
       );
-      addToolLogEntry(msg.name, msg.is_error, msg.content || "", msg.elapsed_ms || 0);
+      addToolLogEntry(toolName, msg.is_error, msg.content || "", msg.elapsed_ms || 0);
     }
     return;
   }
@@ -618,8 +740,9 @@ function handleServerMessage(msg) {
   if (msg.type === "asr") {
     const text = typeof msg.text === "string" ? msg.text : "";
     if (!text.trim()) return;
+    maybeAutoInterruptFromAsr(text, Boolean(msg.is_final));
 
-    if (activeTurnId && msg.is_final) return;
+    if (activeTurnId) return;
 
     if (msg.is_final) {
       const now = Date.now();
@@ -634,6 +757,7 @@ function handleServerMessage(msg) {
       pendingUserBubble = addBubble("user", msg.text);
     } else {
       pendingUserBubble.textContent = msg.text;
+      chatEl.scrollTop = chatEl.scrollHeight;
     }
     return;
   }
@@ -660,6 +784,7 @@ function handleServerMessage(msg) {
       pendingAgentBubble.dataset.turnId = activeTurnId;
     } else {
       pendingAgentBubble.textContent += msg.text;
+      chatEl.scrollTop = chatEl.scrollHeight;
     }
     return;
   }
@@ -671,6 +796,7 @@ function handleServerMessage(msg) {
 
 // ---- WebSocket ----
 function connectWebSocket() {
+  return new Promise((resolve, reject) => {
   const proto = window.location.protocol === "https:" ? "wss" : "ws";
   ws = new WebSocket(`${proto}://${window.location.host}/ws`);
   ws.binaryType = "arraybuffer";
@@ -681,17 +807,22 @@ function connectWebSocket() {
     console.info("[tinyagent] ws open");
     addBubble("system", "WebSocket 已连接");
     startTicker();
+    resolve();
   };
   ws.onclose = (event) => {
     wsConnectedAt = 0;
     setConnBadge(connWs, "disconnected");
     console.warn("[tinyagent] ws close", event.code, event.reason);
     addBubble("system", "WebSocket 已断开");
+    if (event.code !== 1000) {
+      reject(new Error(`WebSocket closed: ${event.code} ${event.reason || ""}`.trim()));
+    }
   };
   ws.onerror = (event) => {
     setConnBadge(connWs, "error");
     console.error("[tinyagent] ws error", event);
     addBubble("system", "WebSocket 错误");
+    reject(new Error("WebSocket error"));
   };
   ws.onmessage = (event) => {
     if (typeof event.data === "string") {
@@ -704,24 +835,25 @@ function connectWebSocket() {
     }
 
     if (event.data instanceof ArrayBuffer && playbackNode && audioCtx) {
-      recvAudioChunks += 1;
-      if (recvAudioChunks % 20 === 0) {
-        console.info("[tinyagent] recv tts audio chunks:", recvAudioChunks);
-      }
       const pcm16 = new Int16Array(event.data);
       const float24k = pcm16ToFloat32(pcm16);
       const floatOut = resampleLinear(float24k, 24000, audioCtx.sampleRate);
       playbackNode.port.postMessage(floatOut);
     }
   };
+  });
 }
 
 // ---- Button handlers ----
 startBtn.addEventListener("click", async () => {
   await initAudio();
   if (!ws || ws.readyState !== WebSocket.OPEN) {
-    connectWebSocket();
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    try {
+      await connectWebSocket();
+    } catch (err) {
+      addBubble("system", `连接失败: ${String(err)}`);
+      return;
+    }
   }
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ type: "start_session" }));

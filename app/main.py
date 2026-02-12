@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import Any
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
@@ -21,28 +20,12 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 STATIC_DIR = ROOT_DIR / "static"
 
 app = FastAPI(title="TinyAgent")
-app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+app.mount("/static", StaticFiles(directory=STATIC_DIR, html=False), name="static")
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("tinyagent.main")
-
-# ---- Startup: discover skills ----
-_skill_manager: SkillManager | None = None
-
-
-@app.on_event("startup")
-async def _startup() -> None:
-    global _skill_manager
-    settings = get_settings()
-    skill_dirs = [ROOT_DIR / d for d in settings.get_skills_dirs()]
-    _skill_manager = SkillManager(skill_dirs=skill_dirs)
-    skills = _skill_manager.discover()
-    logger.info(
-        "Skills discovered: %s",
-        ", ".join(s.name for s in skills) if skills else "(none)",
-    )
 
 
 @app.get("/")
@@ -55,12 +38,6 @@ async def voice_ws(websocket: WebSocket) -> None:
     await websocket.accept()
     logger.info("WebSocket accepted from client")
     settings = get_settings()
-
-    async def send_json(payload: dict[str, Any]) -> None:
-        await websocket.send_json(payload)
-
-    async def send_binary(payload: bytes) -> None:
-        await websocket.send_bytes(payload)
 
     # Each connection gets its own SkillManager (copy state from global)
     skill_dirs = [ROOT_DIR / d for d in settings.get_skills_dirs()]
@@ -79,11 +56,17 @@ async def voice_ws(websocket: WebSocket) -> None:
         allow_shell=settings.tools_allow_shell,
         python_exec_enabled=settings.python_exec_enabled,
         browser_enabled=settings.browser_enabled,
+        google_project=settings.google_project,
+        google_location=settings.google_location,
+        google_credentials_path=settings.google_credentials_path,
+        web_search_gemini_model=settings.web_search_gemini_model,
+        web_search_synthesis_temperature=settings.web_search_synthesis_temperature,
+        web_search_synthesis_max_tokens=settings.web_search_synthesis_max_tokens,
     )
 
     pipeline = Pipeline(
-        send_json=send_json,
-        send_binary=send_binary,
+        send_json=websocket.send_json,
+        send_binary=websocket.send_bytes,
         soniox_api_key=settings.soniox_api_key,
         soniox_ws_url=settings.soniox_ws_url,
         llm_base_url=settings.llm_base_url,
@@ -97,9 +80,10 @@ async def voice_ws(websocket: WebSocket) -> None:
         tool_registry=tool_registry,
         soul_manager=soul_mgr,
         max_tool_rounds=settings.agent_max_tool_rounds,
+        ui_tool_result_max_chars=settings.ui_tool_result_max_chars,
     )
 
-    await send_json(
+    await websocket.send_json(
         {
             "type": "session_info",
             "llm_model": settings.llm_model,
@@ -119,15 +103,15 @@ async def voice_ws(websocket: WebSocket) -> None:
 
     if not settings.asr_configured():
         logger.warning("ASR not configured: SONIOX_API_KEY missing")
-        await send_json({"type": "error", "message": "Missing SONIOX_API_KEY"})
+        await websocket.send_json({"type": "error", "message": "Missing SONIOX_API_KEY"})
     if not settings.llm_configured():
         logger.warning("LLM not configured: one or more LLM_* vars missing")
-        await send_json(
+        await websocket.send_json(
             {"type": "error", "message": "Missing LLM_BASE_URL / LLM_API_KEY / LLM_MODEL"}
         )
     if not settings.tts_configured():
         logger.warning("TTS not configured: DASHSCOPE_API_KEY or TTS_VOICE_ID missing")
-        await send_json(
+        await websocket.send_json(
             {"type": "error", "message": "Missing DASHSCOPE_API_KEY or TTS_VOICE_ID"}
         )
 
@@ -148,7 +132,7 @@ async def voice_ws(websocket: WebSocket) -> None:
             try:
                 payload = json.loads(text_data)
             except json.JSONDecodeError:
-                await send_json({"type": "error", "message": "Invalid JSON message"})
+                await websocket.send_json({"type": "error", "message": "Invalid JSON message"})
                 continue
 
             msg_type = payload.get("type")
@@ -161,17 +145,16 @@ async def voice_ws(websocket: WebSocket) -> None:
             elif msg_type == "interrupt":
                 logger.info("Received control message: interrupt")
                 await pipeline.interrupt()
-            elif msg_type == "activate_skill":
+            elif msg_type in {"activate_skill", "deactivate_skill"}:
                 skill_name = payload.get("name", "")
-                logger.info("Received control message: activate_skill %s", skill_name)
-                await pipeline.activate_skill(skill_name)
-            elif msg_type == "deactivate_skill":
-                skill_name = payload.get("name", "")
-                logger.info("Received control message: deactivate_skill %s", skill_name)
-                await pipeline.deactivate_skill(skill_name)
+                logger.info("Received control message: %s %s", msg_type, skill_name)
+                if msg_type == "activate_skill":
+                    await pipeline.activate_skill(skill_name)
+                else:
+                    await pipeline.deactivate_skill(skill_name)
             else:
                 logger.warning("Received unknown control message type: %s", msg_type)
-                await send_json({"type": "error", "message": f"Unknown message type: {msg_type}"})
+                await websocket.send_json({"type": "error", "message": f"Unknown message type: {msg_type}"})
     except WebSocketDisconnect:
         logger.info("WebSocketDisconnect exception")
         await pipeline.stop_session()

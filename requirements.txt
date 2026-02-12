@@ -6,7 +6,10 @@ dashscope>=1.23.9
 pydantic
 pydantic-settings
 python-dotenv
-numpy
 python-socks
 pyyaml
-duckduckgo-search
+beautifulsoup4
+requests
+google-genai
+browser-use
+langchain-openai

@@ -45,57 +45,131 @@ body {
   font-size: 12px;
 }
 
-/* Tool execution bubble */
-.bubble.tool {
+/* Tool execution group — compact stacked list */
+.tool-group {
   align-self: flex-start;
-  background: linear-gradient(135deg, #f0f9ff 0%, #e8f4f8 100%);
-  border: 1px solid #bae6fd;
-  font-size: 12px;
-  color: #0369a1;
-  max-width: 75%;
+  width: 100%;
+  max-width: 95%;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  border-radius: 10px;
+  overflow: visible;
+  border: 1px solid #e0e7ef;
+  box-shadow: 0 1px 2px rgba(0,0,0,0.04);
+  animation: bubbleIn 0.2s ease-out;
 }
 
-.bubble.tool .tool-header {
+.tool-item {
+  background: #f8fafc;
+  padding: 5px 10px;
+  font-size: 12px;
+  min-height: 24px;
+  cursor: default;
+  transition: background 0.15s;
+  user-select: text;
+  width: 100%;
+  min-width: 0;
+}
+
+.tool-item:hover {
+  background: #f1f5f9;
+}
+
+.tool-item-header {
   display: flex;
   align-items: center;
   gap: 6px;
-  font-weight: 600;
-  margin-bottom: 4px;
+  line-height: 1.25;
+  min-width: 0;
 }
 
-.bubble.tool .tool-spinner {
-  width: 12px;
-  height: 12px;
-  border: 2px solid #bae6fd;
-  border-top-color: #0284c7;
+.tool-item-icon {
+  flex-shrink: 0;
+  width: 14px;
+  height: 14px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.tool-item-icon .tool-spinner {
+  width: 10px;
+  height: 10px;
+  border: 1.5px solid #cbd5e1;
+  border-top-color: #3b82f6;
   border-radius: 50%;
-  animation: spin 0.8s linear infinite;
+  animation: spin 0.7s linear infinite;
 }
 
 @keyframes spin {
   to { transform: rotate(360deg); }
 }
 
-.bubble.tool .tool-result {
-  margin-top: 4px;
-  padding-top: 4px;
-  border-top: 1px solid #bae6fd;
-  color: #334155;
+.tool-item-icon svg {
+  width: 13px;
+  height: 13px;
 }
 
-.bubble.tool .tool-result.error {
+.tool-item-name {
+  font-weight: 600;
+  color: #334155;
+  white-space: nowrap;
+}
+
+.tool-item-name.done {
+  color: #059669;
+}
+
+.tool-item-name.error {
   color: #dc2626;
 }
 
-.bubble.tool .tool-done {
-  color: #059669;
-  font-weight: 600;
+.tool-item-arg {
+  color: #64748b;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+  min-width: 0;
 }
 
-.bubble.tool .tool-time {
+.tool-item-time {
+  flex-shrink: 0;
   font-size: 10px;
   color: #94a3b8;
+  font-variant-numeric: tabular-nums;
   margin-left: auto;
+  padding-left: 8px;
+}
+
+.tool-item-detail {
+  display: none;
+  margin-top: 4px;
+  padding: 4px 0 2px;
+  border-top: 1px solid #e2e8f0;
+  font-size: 11px;
+  color: #475569;
+  line-height: 1.4;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+  cursor: text;
+  max-height: 45vh;
+  overflow-y: auto;
+}
+
+.tool-item.expanded .tool-item-detail {
+  display: block;
+}
+
+.tool-item.has-detail .tool-item-detail {
+  display: block;
+}
+
+.tool-item-detail.error {
+  color: #dc2626;
 }
 
 /* Skill activation bubble */
@@ -359,13 +433,6 @@ body {
 .tool-log-entry.error {
   background: #fef2f2;
   border-color: #fecaca;
-}
-
-.tool-log-icon {
-  flex-shrink: 0;
-  width: 14px;
-  height: 14px;
-  margin-top: 1px;
 }
 
 .tool-log-body {

@@ -8,6 +8,7 @@ import json
 import logging
 import math
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Awaitable, TYPE_CHECKING
@@ -17,6 +18,19 @@ if TYPE_CHECKING:
     from app.skills import SkillManager
 
 logger = logging.getLogger("tinyagent.tools")
+_WEEKDAY_NAMES = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
+_SEARCH_UA = "curl/7.88.1"
+_FETCH_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
+_STRIP_TAGS = {"script", "style", "nav", "header", "footer", "iframe", "noscript", "svg", "form"}
+_WEB_SEARCH_CONTENT_BUDGET = 6000
+_WEB_SEARCH_FETCH_TOP_K = 3
+_WEB_SEARCH_FETCH_WORKERS = 3
+_FETCH_WEBPAGE_MAX_CHARS = 4000
+_TODOS_FILENAME = "TODOS.md"
+_READING_FILENAME = "READING.md"
 
 
 @dataclass
@@ -60,19 +74,17 @@ class ToolRegistry:
 
     def get_openai_tools(self) -> list[dict[str, Any]]:
         """Return tool definitions in OpenAI function-calling format."""
-        result = []
-        for t in self._tools.values():
-            result.append(
-                {
-                    "type": "function",
-                    "function": {
-                        "name": t.name,
-                        "description": t.description,
-                        "parameters": t.parameters,
-                    },
-                }
-            )
-        return result
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": t.name,
+                    "description": t.description,
+                    "parameters": t.parameters,
+                },
+            }
+            for t in self._tools.values()
+        ]
 
     async def execute(self, name: str, arguments: dict[str, Any]) -> ToolResult:
         """Execute a tool by name with given arguments."""
@@ -85,6 +97,56 @@ class ToolRegistry:
             logger.exception("Tool %s execution failed", name)
             return ToolResult(content=f"Tool error: {type(exc).__name__}: {exc}", is_error=True)
 
+
+def _fmt_size(size: int) -> str:
+    if size < 1024:
+        return f"{size} B"
+    if size < 1024 * 1024:
+        return f"{size / 1024:.1f} KB"
+    return f"{size / 1024 / 1024:.1f} MB"
+
+
+def _fetch_page_text(
+    url: str,
+    session: Any,
+    *,
+    max_chars: int,
+    timeout: int,
+) -> tuple[str, str, bool]:
+    """Fetch a URL and extract readable text. Returns (final_url, text, truncated)."""
+    try:
+        resp = session.get(
+            url,
+            headers={"User-Agent": _FETCH_UA, "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8"},
+            timeout=timeout,
+            allow_redirects=True,
+        )
+        resp.raise_for_status()
+        if "text/html" not in resp.headers.get("content-type", "").lower():
+            return str(resp.url), "", False
+        if resp.encoding and resp.encoding.lower() == "iso-8859-1":
+            resp.encoding = resp.apparent_encoding
+
+        from bs4 import BeautifulSoup
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+        for tag in soup(_STRIP_TAGS):
+            tag.decompose()
+        main = (
+            soup.find("main")
+            or soup.find("article")
+            or soup.find("div", id="content")
+            or soup.find("div", class_="content")
+            or soup.body
+            or soup
+        )
+        text = main.get_text(separator="\n", strip=True)
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        collapsed = "\n".join(lines)
+        truncated = len(collapsed) > max_chars
+        return str(resp.url), collapsed[:max_chars], truncated
+    except Exception:
+        return "", "", False
 
 # ---------------------------------------------------------------------------
 # Built-in tools
@@ -101,15 +163,9 @@ def _make_get_datetime() -> ToolDefinition:
             else:
                 tz = None
             now = datetime.datetime.now(tz=tz)
+            weekday_name = _WEEKDAY_NAMES[now.weekday()]
             return ToolResult(
-                content=now.strftime("%Y-%m-%d %H:%M:%S %Z (星期%w)")
-                .replace("星期0", "星期日")
-                .replace("星期1", "星期一")
-                .replace("星期2", "星期二")
-                .replace("星期3", "星期三")
-                .replace("星期4", "星期四")
-                .replace("星期5", "星期五")
-                .replace("星期6", "星期六")
+                content=now.strftime(f"%Y-%m-%d %H:%M:%S %Z ({weekday_name})")
             )
         except Exception as exc:
             return ToolResult(content=f"Error: {exc}", is_error=True)
@@ -172,54 +228,176 @@ def _make_calculate() -> ToolDefinition:
     )
 
 
-def _make_web_search() -> ToolDefinition:
+def _make_web_search(
+    *,
+    google_project: str = "",
+    google_location: str = "global",
+    google_credentials_path: str = "",
+    gemini_model: str = "gemini-2.5-flash",
+    synthesis_temperature: float = 0.3,
+    synthesis_max_tokens: int = 1024,
+) -> ToolDefinition:
+    synthesis_temperature = min(1.0, max(0.0, synthesis_temperature))
+    synthesis_max_tokens = max(128, synthesis_max_tokens)
+    client_holder: dict[str, Any] = {"client": None}
+
+    def _build_grounded_prompt(origin_query: str) -> str:
+        return (
+            "Answer the user's question based on grounded web search results.\n"
+            "Requirements:\n"
+            "1. Respond in the SAME LANGUAGE as the user's question.\n"
+            "2. Be direct and conversational, avoid phrases like 'According to search results'.\n"
+            "3. Keep concise: <=150 Chinese chars for Chinese replies, <=200 words for English replies.\n"
+            "4. State verifiable facts only; do not speculate.\n"
+            "5. If information is uncertain or conflicting, state uncertainty briefly.\n\n"
+            f"User question: {origin_query}"
+        )
+
+    def _get_client() -> Any:
+        if client_holder["client"] is not None:
+            return client_holder["client"]
+        if not google_project:
+            raise ValueError("Missing GOOGLE_PROJECT for Gemini Vertex web_search.")
+        if not google_location:
+            raise ValueError("Missing GOOGLE_LOCATION for Gemini Vertex web_search.")
+        if google_credentials_path:
+            os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = google_credentials_path
+        from google import genai
+
+        client_holder["client"] = genai.Client(
+            vertexai=True,
+            project=google_project,
+            location=google_location,
+        )
+        return client_holder["client"]
+
+    def _extract_sources(response: Any, limit: int = 3) -> list[str]:
+        try:
+            payload = response.model_dump() if hasattr(response, "model_dump") else {}
+            urls: list[str] = []
+            candidates = payload.get("candidates", [])
+            for c in candidates:
+                gm = c.get("grounding_metadata", {})
+                for chunk in gm.get("grounding_chunks", []):
+                    web = chunk.get("web", {})
+                    uri = web.get("uri")
+                    if uri and uri not in urls:
+                        urls.append(uri)
+                    if len(urls) >= limit:
+                        return urls
+            return urls
+        except Exception:
+            return []
+
+    def _grounded_search(origin_query: str) -> str:
+        from google.genai.types import GenerateContentConfig, GoogleSearch, Tool
+
+        client = _get_client()
+        prompt = _build_grounded_prompt(origin_query)
+        response = client.models.generate_content(
+            model=gemini_model,
+            contents=prompt,
+            config=GenerateContentConfig(
+                tools=[Tool(google_search=GoogleSearch())],
+                temperature=synthesis_temperature,
+                max_output_tokens=synthesis_max_tokens,
+            ),
+        )
+        text = (response.text or "").strip()
+        if not text:
+            return "搜索完成，但未找到可确认的有效信息。"
+        sources = _extract_sources(response)
+        if not sources:
+            return text
+        return text + "\n\n参考来源:\n" + "\n".join(f"- {url}" for url in sources)
+
     async def execute(args: dict[str, Any]) -> ToolResult:
         query = args.get("query", "")
-        max_results = args.get("max_results", 3)
         if not query:
             return ToolResult(content="No search query.", is_error=True)
         try:
-            from duckduckgo_search import DDGS
-
-            def _search() -> str:
-                with DDGS() as ddgs:
-                    results = list(ddgs.text(query, max_results=min(max_results, 5)))
-                if not results:
-                    return "No results found."
-                lines = []
-                for i, r in enumerate(results, 1):
-                    title = r.get("title", "")
-                    body = r.get("body", "")
-                    href = r.get("href", "")
-                    lines.append(f"{i}. {title}\n   {body}\n   {href}")
-                return "\n\n".join(lines)
-
-            text = await asyncio.get_event_loop().run_in_executor(None, _search)
+            text = await asyncio.get_event_loop().run_in_executor(
+                None, _grounded_search, query
+            )
             return ToolResult(content=text)
         except ImportError:
             return ToolResult(
-                content="Web search unavailable (duckduckgo-search not installed).",
+                content=(
+                    "Web search unavailable: missing google-genai package. "
+                    "Install with `pip install google-genai`."
+                ),
                 is_error=True,
             )
         except Exception as exc:
-            return ToolResult(content=f"Search error: {exc}", is_error=True)
+            return ToolResult(content=f"Search error: {type(exc).__name__}: {exc}", is_error=True)
 
     return ToolDefinition(
         name="web_search",
-        description="搜索互联网获取实时信息。使用DuckDuckGo搜索引擎，无需API密钥。",
+        description=(
+            "使用 Gemini Vertex Grounding 搜索实时信息并直接返回可播报答案。"
+            "适用于当前事实、最新动态和时效性问题。"
+        ),
         parameters={
             "type": "object",
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "搜索关键词",
-                },
-                "max_results": {
-                    "type": "integer",
-                    "description": "最大结果数（1-5，默认3）",
+                    "description": "用户的搜索问题，支持中文/英文/日文等多语言自然问句。",
                 },
             },
             "required": ["query"],
+        },
+        execute=execute,
+    )
+
+
+def _make_fetch_webpage() -> ToolDefinition:
+    """Lightweight webpage fetcher — requests + BeautifulSoup, no headless browser."""
+
+    async def execute(args: dict[str, Any]) -> ToolResult:
+        url = args.get("url", "")
+        if not url:
+            return ToolResult(content="No URL provided.", is_error=True)
+        try:
+            import requests
+
+            def _fetch() -> str:
+                with requests.Session() as session:
+                    final_url, text, truncated = _fetch_page_text(
+                        url,
+                        session,
+                        max_chars=_FETCH_WEBPAGE_MAX_CHARS,
+                        timeout=10,
+                    )
+                if not text:
+                    return "Page returned no readable text."
+                if truncated:
+                    text += "\n...(truncated)"
+                display_url = final_url or url
+                return f"[{display_url}]\n\n{text}"
+
+            text = await asyncio.get_event_loop().run_in_executor(None, _fetch)
+            return ToolResult(content=text)
+        except ImportError:
+            return ToolResult(
+                content="fetch_webpage unavailable (requests or beautifulsoup4 not installed).",
+                is_error=True,
+            )
+        except Exception as exc:
+            return ToolResult(content=f"Fetch error: {exc}", is_error=True)
+
+    return ToolDefinition(
+        name="fetch_webpage",
+        description="抓取网页内容并提取正文文本。配合 web_search 使用：先搜索获得链接，再用此工具获取页面详细内容。",
+        parameters={
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "要抓取的网页URL",
+                },
+            },
+            "required": ["url"],
         },
         execute=execute,
     )
@@ -299,13 +477,8 @@ def _make_write_file() -> ToolDefinition:
     )
 
 
-def _make_run_command(allowed: bool = False) -> ToolDefinition:
+def _make_run_command() -> ToolDefinition:
     async def execute(args: dict[str, Any]) -> ToolResult:
-        if not allowed:
-            return ToolResult(
-                content="Shell commands are disabled. Set TOOLS_ALLOW_SHELL=true to enable.",
-                is_error=True,
-            )
         command = args.get("command", "")
         if not command:
             return ToolResult(content="No command provided.", is_error=True)
@@ -350,12 +523,12 @@ def _make_run_command(allowed: bool = False) -> ToolDefinition:
 
 def _make_list_skills(skill_manager: SkillManager) -> ToolDefinition:
     async def execute(args: dict[str, Any]) -> ToolResult:
-        skills = skill_manager.all_skills
+        skills = skill_manager.all_skills()
         if not skills:
             return ToolResult(content="当前没有可用的技能。")
         lines = []
         for s in skills:
-            status = "[已激活]" if s.name in skill_manager.active_names else "[未激活]"
+            status = "[已激活]" if skill_manager.is_active(s.name) else "[未激活]"
             lines.append(f"- {s.name} {status}: {s.description}")
         return ToolResult(content="\n".join(lines))
 
@@ -372,10 +545,11 @@ def _make_activate_skill(skill_manager: SkillManager) -> ToolDefinition:
         name = args.get("skill_name", "")
         if not name:
             return ToolResult(content="No skill name provided.", is_error=True)
+        all_skills = skill_manager.all_skills()
         if skill_manager.activate(name):
-            skill = skill_manager.get_skill(name)
+            skill = next((s for s in all_skills if s.name == name), None)
             return ToolResult(content=f"已激活技能: {name} - {skill.description if skill else ''}")
-        available = ", ".join(s.name for s in skill_manager.all_skills)
+        available = ", ".join(s.name for s in all_skills)
         return ToolResult(
             content=f"未找到技能 '{name}'。可用技能: {available}",
             is_error=True,
@@ -499,9 +673,140 @@ def _make_save_note(soul_manager: SoulManager) -> ToolDefinition:
     )
 
 
-def _make_run_python(enabled: bool = True) -> ToolDefinition:
-    import sys
+def _make_add_todo(soul_manager: SoulManager) -> ToolDefinition:
+    async def execute(args: dict[str, Any]) -> ToolResult:
+        content = args.get("content", "").strip()
+        due_date = args.get("due_date", "").strip()
+        if not content:
+            return ToolResult(content="No todo content provided.", is_error=True)
 
+        todo_path = soul_manager.soul_dir / _TODOS_FILENAME
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+        due_text = f" | 截止: {due_date}" if due_date else ""
+        item = f"- [ ] {content}{due_text} | 创建: {now}"
+
+        try:
+            if not todo_path.exists():
+                todo_path.write_text(
+                    "# 待办清单\n\n*此文件由 TinyAgent 自动维护。*\n\n",
+                    encoding="utf-8",
+                )
+            with todo_path.open("a", encoding="utf-8") as f:
+                f.write(item + "\n")
+            return ToolResult(content=f"已添加待办：{content}")
+        except Exception as exc:
+            return ToolResult(content=f"Add todo error: {exc}", is_error=True)
+
+    return ToolDefinition(
+        name="add_todo",
+        description="添加一条待办事项到本地待办清单。适用于记录任务、提醒事项和短期行动项。",
+        parameters={
+            "type": "object",
+            "properties": {
+                "content": {
+                    "type": "string",
+                    "description": "待办内容，如 '周五发周报'",
+                },
+                "due_date": {
+                    "type": "string",
+                    "description": "可选截止时间，如 '今天'、'明天下午三点' 或 '2026-02-14'",
+                },
+            },
+            "required": ["content"],
+        },
+        execute=execute,
+    )
+
+
+def _make_list_todos(soul_manager: SoulManager) -> ToolDefinition:
+    async def execute(args: dict[str, Any]) -> ToolResult:
+        limit = args.get("limit", 10)
+        if not isinstance(limit, int):
+            return ToolResult(content="limit must be an integer.", is_error=True)
+        limit = max(1, min(limit, 50))
+
+        todo_path = soul_manager.soul_dir / _TODOS_FILENAME
+        if not todo_path.exists():
+            return ToolResult(content="待办清单为空。")
+
+        try:
+            lines = todo_path.read_text(encoding="utf-8").splitlines()
+            items = [line.strip() for line in lines if line.strip().startswith("- [")]
+            if not items:
+                return ToolResult(content="待办清单为空。")
+            recent = list(reversed(items))[:limit]
+            content = "最近待办：\n" + "\n".join(
+                f"{idx + 1}. {item}" for idx, item in enumerate(recent)
+            )
+            return ToolResult(content=content)
+        except Exception as exc:
+            return ToolResult(content=f"List todos error: {exc}", is_error=True)
+
+    return ToolDefinition(
+        name="list_todos",
+        description="查看待办清单，默认返回最近10条。",
+        parameters={
+            "type": "object",
+            "properties": {
+                "limit": {
+                    "type": "integer",
+                    "description": "返回条数上限，默认10，最大50。",
+                },
+            },
+            "required": [],
+        },
+        execute=execute,
+    )
+
+
+def _make_add_reading_item(soul_manager: SoulManager) -> ToolDefinition:
+    async def execute(args: dict[str, Any]) -> ToolResult:
+        url = args.get("url", "").strip()
+        note = args.get("note", "").strip()
+        if not url:
+            return ToolResult(content="No URL provided.", is_error=True)
+        if not (url.startswith("http://") or url.startswith("https://")):
+            return ToolResult(content="URL must start with http:// or https://", is_error=True)
+
+        reading_path = soul_manager.soul_dir / _READING_FILENAME
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+        note_text = f" | 备注: {note}" if note else ""
+        item = f"- [ ] {url}{note_text} | 添加: {now}"
+
+        try:
+            if not reading_path.exists():
+                reading_path.write_text(
+                    "# 阅读清单\n\n*此文件由 TinyAgent 自动维护。*\n\n",
+                    encoding="utf-8",
+                )
+            with reading_path.open("a", encoding="utf-8") as f:
+                f.write(item + "\n")
+            return ToolResult(content=f"已加入阅读清单：{url}")
+        except Exception as exc:
+            return ToolResult(content=f"Add reading item error: {exc}", is_error=True)
+
+    return ToolDefinition(
+        name="add_reading_item",
+        description="把网页链接加入本地阅读清单，便于稍后阅读与回顾。",
+        parameters={
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "要保存的网页链接，需以 http:// 或 https:// 开头。",
+                },
+                "note": {
+                    "type": "string",
+                    "description": "可选备注，如 '晚点看这个发布会总结'。",
+                },
+            },
+            "required": ["url"],
+        },
+        execute=execute,
+    )
+
+
+def _make_run_python(enabled: bool = True) -> ToolDefinition:
     async def execute(args: dict[str, Any]) -> ToolResult:
         if not enabled:
             return ToolResult(
@@ -570,15 +875,11 @@ def _make_list_directory() -> ToolDefinition:
                     mtime = datetime.datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M")
                     if entry.is_dir():
                         lines.append(f"  [DIR]  {entry.name}/")
-                    elif size < 1024:
-                        lines.append(f"  {size:>8d} B  {mtime}  {entry.name}")
-                    elif size < 1024 * 1024:
-                        lines.append(f"  {size/1024:>7.1f} KB  {mtime}  {entry.name}")
                     else:
-                        lines.append(f"  {size/1024/1024:>7.1f} MB  {mtime}  {entry.name}")
+                        lines.append(f"  {_fmt_size(size):>8}  {mtime}  {entry.name}")
                 except OSError:
                     lines.append(f"  [???]  {entry.name}")
-            total = len(list(path.iterdir()))
+            total = len(entries)
             if total > 100:
                 lines.append(f"\n  ... and {total - 100} more entries")
             lines.append(f"\nTotal: {total} items")
@@ -615,7 +916,8 @@ def _make_search_files() -> ToolDefinition:
         if not path.is_dir():
             return ToolResult(content=f"Not a directory: {path}", is_error=True)
         try:
-            matches = list(path.rglob(pattern))[:50]  # Cap at 50 results
+            all_matches = list(path.rglob(pattern))
+            matches = all_matches[:50]  # Cap at 50 results
             if not matches:
                 return ToolResult(content=f"No files matching '{pattern}' in {path}")
             lines = [f"Found {len(matches)} file(s) matching '{pattern}' in {path}:\n"]
@@ -623,15 +925,10 @@ def _make_search_files() -> ToolDefinition:
                 try:
                     rel = m.relative_to(path)
                     size = m.stat().st_size
-                    if size < 1024:
-                        lines.append(f"  {rel}  ({size} B)")
-                    elif size < 1024 * 1024:
-                        lines.append(f"  {rel}  ({size/1024:.1f} KB)")
-                    else:
-                        lines.append(f"  {rel}  ({size/1024/1024:.1f} MB)")
+                    lines.append(f"  {rel}  ({_fmt_size(size)})")
                 except (OSError, ValueError):
                     lines.append(f"  {m}")
-            total = len(list(path.rglob(pattern)))
+            total = len(all_matches)
             if total > 50:
                 lines.append(f"\n  ... and {total - 50} more matches")
             return ToolResult(content="\n".join(lines))
@@ -667,6 +964,12 @@ def create_default_registry(
     allow_shell: bool = False,
     python_exec_enabled: bool = True,
     browser_enabled: bool = False,
+    google_project: str = "",
+    google_location: str = "global",
+    google_credentials_path: str = "",
+    web_search_gemini_model: str = "gemini-2.5-flash",
+    web_search_synthesis_temperature: float = 0.3,
+    web_search_synthesis_max_tokens: int = 1024,
 ) -> ToolRegistry:
     """Create a ToolRegistry with the standard built-in tools."""
     registry = ToolRegistry()
@@ -674,10 +977,17 @@ def create_default_registry(
     all_tools: dict[str, ToolDefinition] = {
         "get_datetime": _make_get_datetime(),
         "calculate": _make_calculate(),
-        "web_search": _make_web_search(),
+        "web_search": _make_web_search(
+            google_project=google_project,
+            google_location=google_location,
+            google_credentials_path=google_credentials_path,
+            gemini_model=web_search_gemini_model,
+            synthesis_temperature=web_search_synthesis_temperature,
+            synthesis_max_tokens=web_search_synthesis_max_tokens,
+        ),
+        "fetch_webpage": _make_fetch_webpage(),
         "read_file": _make_read_file(),
         "write_file": _make_write_file(),
-        "run_command": _make_run_command(allowed=allow_shell),
         "run_python": _make_run_python(enabled=python_exec_enabled),
         "list_directory": _make_list_directory(),
         "search_files": _make_search_files(),
@@ -685,12 +995,17 @@ def create_default_registry(
         "activate_skill": _make_activate_skill(skill_manager),
         "deactivate_skill": _make_deactivate_skill(skill_manager),
     }
+    if allow_shell:
+        all_tools["run_command"] = _make_run_command()
 
     # Soul/memory tools (require SoulManager)
     if soul_manager is not None:
         all_tools["recall_memory"] = _make_recall_memory(soul_manager)
         all_tools["update_user_profile"] = _make_update_user_profile(soul_manager)
         all_tools["save_note"] = _make_save_note(soul_manager)
+        all_tools["add_todo"] = _make_add_todo(soul_manager)
+        all_tools["list_todos"] = _make_list_todos(soul_manager)
+        all_tools["add_reading_item"] = _make_add_reading_item(soul_manager)
 
     # Browser tool (optional, requires browser-use)
     if browser_enabled:
@@ -704,15 +1019,27 @@ def create_default_registry(
     if enabled_tools is None:
         # Default: everything except shell and browser for safety
         enabled_tools = [
-            "get_datetime", "calculate", "web_search", "read_file",
+            "get_datetime", "calculate", "web_search", "fetch_webpage", "read_file",
             "run_python", "list_directory", "search_files",
             "list_skills", "activate_skill", "deactivate_skill",
-            "recall_memory", "update_user_profile", "save_note",
         ]
+        if soul_manager is not None:
+            enabled_tools.extend(
+                [
+                    "recall_memory",
+                    "update_user_profile",
+                    "save_note",
+                    "add_todo",
+                    "list_todos",
+                    "add_reading_item",
+                ]
+            )
         if browser_enabled and "browse_web" in all_tools:
             enabled_tools.append("browse_web")
 
     for name in enabled_tools:
+        if name == "browse_web" and not browser_enabled:
+            continue
         if name in all_tools:
             registry.register(all_tools[name])
         else:

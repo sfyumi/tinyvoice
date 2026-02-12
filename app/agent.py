@@ -9,14 +9,15 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any, Callable, Awaitable
 
-from app.llm import LLMClient, LLMResponse, AGENT_INSTRUCTIONS
+from app.llm import LLMClient, LLMResponse
 from app.memory import SoulManager
 from app.skills import SkillManager
-from app.tools import ToolRegistry, ToolResult
+from app.tools import ToolRegistry
 
 logger = logging.getLogger("tinyagent.agent")
 
 MAX_TOOL_ROUNDS = 5
+TOOL_RESULT_PREVIEW_CHARS = 2000
 
 
 @dataclass
@@ -46,12 +47,14 @@ class AgentLoop:
         skills: SkillManager,
         soul: SoulManager,
         max_rounds: int = MAX_TOOL_ROUNDS,
+        tool_result_preview_chars: int = TOOL_RESULT_PREVIEW_CHARS,
     ) -> None:
         self._llm = llm
         self._tools = tools
         self._skills = skills
         self._soul = soul
         self._max_rounds = max_rounds
+        self._tool_result_preview_chars = max(200, tool_result_preview_chars)
 
     def _update_system_prompt(self) -> None:
         """Rebuild the system prompt: soul + user + agent instructions + skills."""
@@ -62,8 +65,10 @@ class AgentLoop:
         if soul_prompt:
             parts.append(soul_prompt)
 
-        # 2. Agent instructions (capabilities and rules)
-        parts.append(AGENT_INSTRUCTIONS)
+        # 2. Agent instructions (capabilities and rules from soul/AGENT.md)
+        agent_instructions = self._soul.get_agent_instructions_prompt()
+        if agent_instructions:
+            parts.append(agent_instructions)
 
         # 3. Skills (available capabilities + active skill instructions)
         base = "\n".join(parts)
@@ -81,12 +86,25 @@ class AgentLoop:
 
         Yields text tokens for TTS as they arrive from the final LLM response.
         Emits AgentEvents for tool calls and skill changes via on_event callback.
+
+        Design:
+          - Every round uses tool_choice="auto"; the model freely decides.
+          - If the model replies with text at any point, we yield it and return.
+          - If all ``max_rounds`` rounds are consumed by tool calls, we make
+            one final text-only call (``stream_text_only``) that converts
+            tool history to plain text so every provider can handle it.
         """
         self._update_system_prompt()
         self._llm.add_user_message(user_text)
 
-        openai_tools = self._tools.get_openai_tools() or None
+        openai_tools = self._tools.get_openai_tools()
         rounds = 0
+        tool_seq = 0
+
+        async def _noop(_: AgentEvent) -> None:
+            return
+
+        emit = on_event or _noop
 
         while rounds < self._max_rounds:
             if cancel_event and cancel_event.is_set():
@@ -94,17 +112,10 @@ class AgentLoop:
                 return
 
             rounds += 1
-            collected_text: list[str] = []
-
-            async def on_text_delta(token: str) -> None:
-                collected_text.append(token)
-
-            if on_event:
-                await on_event(AgentEvent(type="thinking", data={"round": rounds}))
+            await emit(AgentEvent(type="thinking", data={"round": rounds}))
 
             response: LLMResponse = await self._llm.stream_chat_with_tools(
                 tools=openai_tools,
-                on_text_delta=on_text_delta,
             )
 
             if cancel_event and cancel_event.is_set():
@@ -112,21 +123,26 @@ class AgentLoop:
                 return
 
             # If LLM returned tool calls, execute them and loop
-            if response.has_tool_calls:
+            if response.tool_calls:
                 for tc in response.tool_calls:
+                    tool_seq += 1
+                    tool_call_id = (tc.id or "").strip()
+                    if not tool_call_id:
+                        # Some providers may stream tool calls without ids.
+                        # Ensure frontend can always correlate start/result events.
+                        tool_call_id = f"fallback_{rounds}_{tool_seq}_{int(time.time() * 1000)}"
                     logger.info("Tool call: %s(%s)", tc.name, tc.arguments)
 
-                    if on_event:
-                        await on_event(
-                            AgentEvent(
-                                type="tool_start",
-                                data={
-                                    "tool_call_id": tc.id,
-                                    "name": tc.name,
-                                    "arguments": tc.arguments,
-                                },
-                            )
+                    await emit(
+                        AgentEvent(
+                            type="tool_start",
+                            data={
+                                "tool_call_id": tool_call_id,
+                                "name": tc.name,
+                                "arguments": tc.arguments,
+                            },
                         )
+                    )
 
                     if cancel_event and cancel_event.is_set():
                         logger.info("Agent cancelled during tool execution")
@@ -145,61 +161,58 @@ class AgentLoop:
                     )
 
                     # Record tool result in LLM history
-                    self._llm.add_tool_result(tc.id, tc.name, result.content)
+                    self._llm.add_tool_result(tool_call_id, tc.name, result.content)
 
-                    if on_event:
-                        await on_event(
-                            AgentEvent(
-                                type="tool_result",
-                                data={
-                                    "tool_call_id": tc.id,
-                                    "name": tc.name,
-                                    "content": result.content[:500],
-                                    "is_error": result.is_error,
-                                    "elapsed_ms": elapsed_ms,
-                                },
-                            )
+                    await emit(
+                        AgentEvent(
+                            type="tool_result",
+                            data={
+                                "tool_call_id": tool_call_id,
+                                "name": tc.name,
+                                "content": result.content[: self._tool_result_preview_chars],
+                                "is_error": result.is_error,
+                                "elapsed_ms": elapsed_ms,
+                            },
                         )
+                    )
 
                     # Check if a skill was activated/deactivated
                     if tc.name in ("activate_skill", "deactivate_skill"):
                         self._update_system_prompt()
-                        if on_event:
-                            await on_event(
-                                AgentEvent(
-                                    type="skill_changed",
-                                    data={
-                                        "action": tc.name,
-                                        "skill_name": tc.arguments.get("skill_name", ""),
-                                        "skills": self._skills.to_info_dict(),
-                                    },
-                                )
+                        await emit(
+                            AgentEvent(
+                                type="skill_changed",
+                                data={
+                                    "action": tc.name,
+                                    "skill_name": tc.arguments.get("skill_name", ""),
+                                    "skills": self._skills.to_info_dict(),
+                                },
                             )
+                        )
 
                 # Continue the loop -- LLM will see tool results
                 continue
 
             # No tool calls -- yield text tokens for TTS
-            # The text was already streamed via on_text_delta, but we yield it here
-            # for the pipeline to feed into TTS
-            if response.text:
-                for token in collected_text:
+            if response.tokens:
+                for token in response.tokens:
                     yield token
             return
 
-        # Max rounds reached -- force a text response without tools
-        logger.warning("Agent hit max %d tool rounds, forcing text-only response", self._max_rounds)
-        collected_text = []
-
-        async def on_final_delta(token: str) -> None:
-            collected_text.append(token)
-
-        self._llm.add_user_message(
-            "(系统提示：你已经使用了多轮工具调用。请直接用文字回复用户。)"
+        # ------------------------------------------------------------------
+        # Max rounds exhausted — every round produced tool calls.
+        # Force a text-only response via a dedicated path that converts
+        # tool history to plain text (no tools / tool_choice in the request),
+        # with a built-in fallback if the API still errors.
+        # ------------------------------------------------------------------
+        logger.warning(
+            "Agent hit max %d tool rounds, forcing text-only response",
+            self._max_rounds,
         )
-        response = await self._llm.stream_chat_with_tools(
-            tools=None,  # No tools this time
-            on_text_delta=on_final_delta,
+        await emit(AgentEvent(type="thinking", data={"round": "final"}))
+
+        response = await self._llm.stream_text_only(
+            nudge="(系统提示：你已经完成了多轮工具调用。请根据上面获得的工具结果，直接用语音友好的文字回复用户。不要再调用任何工具。)",
         )
-        for token in collected_text:
+        for token in response.tokens:
             yield token

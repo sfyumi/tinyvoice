@@ -2,18 +2,18 @@
 import asyncio
 import json
 import logging
-from collections.abc import AsyncIterator, Callable
-from typing import Any
+from collections.abc import AsyncIterator
 
 import websockets
 from websockets.exceptions import ConnectionClosed
 
 logger = logging.getLogger("tinyagent.asr")
+DEFAULT_LANGUAGE_HINTS = ["zh", "en"]
 
 
 def _build_config(api_key: str, language_hints: list[str] | None = None) -> dict:
     if language_hints is None:
-        language_hints = ["zh", "en"]
+        language_hints = DEFAULT_LANGUAGE_HINTS
     return {
         "api_key": api_key,
         "model": "stt-rt-v4",
@@ -25,84 +25,6 @@ def _build_config(api_key: str, language_hints: list[str] | None = None) -> dict
         "sample_rate": 16000,
         "num_channels": 1,
     }
-
-
-async def run_asr_session(
-    api_key: str,
-    audio_chunks: AsyncIterator[bytes],
-    *,
-    on_transcript: Callable[[str, bool], Any] | None = None,
-    on_sentence: Callable[[str], Any] | None = None,
-    language_hints: list[str] | None = None,
-) -> str | None:
-    """
-    Run a Soniox ASR session: send config, stream audio from audio_chunks, parse responses.
-
-    - on_transcript(text, is_final) is called for real-time display.
-    - on_sentence(full_text) is called when the user stops speaking (endpoint or finished).
-    Returns the final complete sentence text, or None if session ended without one.
-    """
-    config = _build_config(api_key, language_hints=language_hints)
-    final_tokens: list[dict] = []
-    last_sentence: str | None = None
-
-    async def collect_final_text() -> str:
-        return "".join(t.get("text", "") for t in final_tokens)
-
-    async with websockets.connect("wss://stt-rt.soniox.com/transcribe-websocket") as ws:
-        await ws.send(json.dumps(config))
-
-        async def send_audio() -> None:
-            try:
-                async for chunk in audio_chunks:
-                    if chunk:
-                        await ws.send(chunk)
-            except Exception:
-                pass
-            await ws.send("")
-
-        send_task = asyncio.create_task(send_audio())
-
-        try:
-            while True:
-                try:
-                    msg = await asyncio.wait_for(ws.recv(), timeout=300.0)
-                except asyncio.TimeoutError:
-                    break
-                if isinstance(msg, bytes):
-                    continue
-                res = json.loads(msg)
-                if res.get("error_code") is not None:
-                    raise RuntimeError(
-                        f"ASR error: {res.get('error_code')} - {res.get('error_message', '')}"
-                    )
-                non_final_text_parts: list[str] = []
-                for token in res.get("tokens", []):
-                    text = token.get("text") or ""
-                    if not text:
-                        continue
-                    if token.get("is_final"):
-                        final_tokens.append(token)
-                    else:
-                        non_final_text_parts.append(text)
-                full_final = "".join(t.get("text", "") for t in final_tokens)
-                provisional = "".join(non_final_text_parts)
-                if on_transcript:
-                    if full_final or provisional:
-                        on_transcript(full_final + provisional, not non_final_text_parts)
-                if res.get("finished"):
-                    last_sentence = await collect_final_text()
-                    if last_sentence.strip() and on_sentence:
-                        on_sentence(last_sentence.strip())
-                    break
-        finally:
-            send_task.cancel()
-            try:
-                await send_task
-            except asyncio.CancelledError:
-                pass
-
-    return last_sentence if (last_sentence and last_sentence.strip()) else None
 
 
 class SonioxASRClient:
@@ -120,7 +42,7 @@ class SonioxASRClient:
     ) -> None:
         self._api_key = api_key
         self._ws_url = ws_url
-        self._language_hints = language_hints or ["zh", "en"]
+        self._language_hints = language_hints or DEFAULT_LANGUAGE_HINTS
         self._audio_queue: asyncio.Queue[bytes | None] = asyncio.Queue()
         self._transcript_queue: asyncio.Queue[tuple[str, bool]] = asyncio.Queue()
         self._sentence_queue: asyncio.Queue[str] = asyncio.Queue()

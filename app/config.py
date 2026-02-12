@@ -37,13 +37,26 @@ class Settings(BaseSettings):
     # Agent / Skills / Tools settings
     skills_dirs: str = Field(default="skills", alias="SKILLS_DIRS")
     tools_enabled: str = Field(
-        default="get_datetime,calculate,web_search,read_file,run_python,list_directory,search_files,list_skills,activate_skill,deactivate_skill",
+        default=(
+            "get_datetime,calculate,web_search,fetch_webpage,read_file,run_python,"
+            "list_directory,search_files,list_skills,activate_skill,deactivate_skill,"
+            "recall_memory,update_user_profile,save_note,add_todo,list_todos,add_reading_item,browse_web"
+        ),
         alias="TOOLS_ENABLED",
     )
     agent_max_tool_rounds: int = Field(default=5, alias="AGENT_MAX_TOOL_ROUNDS")
     tools_allow_shell: bool = Field(default=False, alias="TOOLS_ALLOW_SHELL")
     python_exec_enabled: bool = Field(default=True, alias="PYTHON_EXEC_ENABLED")
     browser_enabled: bool = Field(default=False, alias="BROWSER_ENABLED")
+    web_search_content_budget: int = Field(default=6000, alias="WEB_SEARCH_CONTENT_BUDGET")
+    web_search_fetch_top_k: int = Field(default=3, alias="WEB_SEARCH_FETCH_TOP_K")
+    ui_tool_result_max_chars: int = Field(default=2000, alias="UI_TOOL_RESULT_MAX_CHARS")
+    google_project: str = Field(default="", alias="GOOGLE_PROJECT")
+    google_location: str = Field(default="global", alias="GOOGLE_LOCATION")
+    google_credentials_path: str = Field(default="", alias="GOOGLE_CREDENTIALS_PATH")
+    web_search_gemini_model: str = Field(default="gemini-2.5-flash", alias="WEB_SEARCH_GEMINI_MODEL")
+    web_search_synthesis_temperature: float = Field(default=0.3, alias="WEB_SEARCH_SYNTHESIS_TEMPERATURE")
+    web_search_synthesis_max_tokens: int = Field(default=1024, alias="WEB_SEARCH_SYNTHESIS_MAX_TOKENS")
 
     def llm_configured(self) -> bool:
         return bool(self.llm_base_url and self.llm_api_key and self.llm_model)
@@ -54,13 +67,17 @@ class Settings(BaseSettings):
     def tts_configured(self) -> bool:
         return bool(self.dashscope_api_key and self.tts_voice_id)
 
+    @staticmethod
+    def _parse_csv(value: str) -> list[str]:
+        return [item.strip() for item in value.split(",") if item.strip()]
+
     def get_skills_dirs(self) -> list[str]:
         """Parse comma-separated skills directories."""
-        return [d.strip() for d in self.skills_dirs.split(",") if d.strip()]
+        return self._parse_csv(self.skills_dirs)
 
     def get_enabled_tools(self) -> list[str]:
         """Parse comma-separated enabled tools list."""
-        return [t.strip() for t in self.tools_enabled.split(",") if t.strip()]
+        return self._parse_csv(self.tools_enabled)
 
 
 @lru_cache(maxsize=1)

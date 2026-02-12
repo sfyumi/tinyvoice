@@ -23,20 +23,20 @@ class SoulManager:
 
     def __init__(self, soul_dir: Path) -> None:
         self._soul_dir = soul_dir
+        self._soul_dir.mkdir(parents=True, exist_ok=True)
         self._soul_content: str = ""
         self._user_content: str = ""
-        self._loaded = False
+        self._agent_content: str = ""
 
     @property
     def soul_dir(self) -> Path:
         return self._soul_dir
 
     def load(self) -> None:
-        """Read SOUL.md and USER.md from disk. Called once per connection."""
-        self._soul_dir.mkdir(parents=True, exist_ok=True)
-
+        """Read SOUL.md, USER.md and AGENT.md from disk. Called once per connection."""
         soul_path = self._soul_dir / "SOUL.md"
         user_path = self._soul_dir / "USER.md"
+        agent_path = self._soul_dir / "AGENT.md"
 
         if soul_path.exists():
             self._soul_content = soul_path.read_text(encoding="utf-8").strip()
@@ -52,15 +52,12 @@ class SoulManager:
             self._user_content = ""
             logger.info("No USER.md found at %s", user_path)
 
-        self._loaded = True
-
-    def get_soul_prompt(self) -> str:
-        """Return SOUL.md content for injection into system prompt."""
-        return self._soul_content
-
-    def get_user_context(self) -> str:
-        """Return USER.md content for injection into system prompt."""
-        return self._user_content
+        if agent_path.exists():
+            self._agent_content = agent_path.read_text(encoding="utf-8").strip()
+            logger.info("Loaded AGENT.md (%d chars)", len(self._agent_content))
+        else:
+            self._agent_content = ""
+            logger.warning("No AGENT.md found at %s; agent instructions will be empty", agent_path)
 
     def get_memory(self, max_chars: int = DEFAULT_MEMORY_MAX_CHARS) -> str:
         """Read the most recent entries from MEMORY.md (on-demand, not auto-injected)."""
@@ -88,7 +85,6 @@ class SoulManager:
     def update_user(self, updates: str) -> str:
         """Merge updates into USER.md. Returns the new content."""
         user_path = self._soul_dir / "USER.md"
-        self._soul_dir.mkdir(parents=True, exist_ok=True)
 
         # Read existing content
         existing = ""
@@ -112,7 +108,6 @@ class SoulManager:
     def append_memory(self, summary: str) -> None:
         """Append a session summary to MEMORY.md with timestamp."""
         memory_path = self._soul_dir / "MEMORY.md"
-        self._soul_dir.mkdir(parents=True, exist_ok=True)
 
         now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
         entry = f"\n## {now}\n\n{summary.strip()}\n"
@@ -145,6 +140,10 @@ class SoulManager:
 
         return "\n".join(parts)
 
+    def get_agent_instructions_prompt(self) -> str:
+        """Return AGENT.md content used as runtime agent instructions."""
+        return self._agent_content
+
     def to_info_dict(self) -> dict:
         """Return soul/memory status for frontend display."""
         memory_path = self._soul_dir / "MEMORY.md"
@@ -159,7 +158,9 @@ class SoulManager:
         return {
             "soul_loaded": bool(self._soul_content),
             "user_loaded": bool(self._user_content),
+            "agent_loaded": bool(self._agent_content),
             "memory_entries": memory_entries,
             "soul_chars": len(self._soul_content),
             "user_chars": len(self._user_content),
+            "agent_chars": len(self._agent_content),
         }

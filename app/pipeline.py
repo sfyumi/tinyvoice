@@ -42,6 +42,7 @@ class Pipeline:
         tool_registry: ToolRegistry,
         soul_manager: SoulManager,
         max_tool_rounds: int = 5,
+        ui_tool_result_max_chars: int = 2000,
     ) -> None:
         self._send_json = send_json
         self._send_binary = send_binary
@@ -66,6 +67,7 @@ class Pipeline:
             skills=self._skills,
             soul=self._soul,
             max_rounds=max_tool_rounds,
+            tool_result_preview_chars=ui_tool_result_max_chars,
         )
         self._completed_turns: int = 0
         self._audio_queue: asyncio.Queue[bytes | None] = asyncio.Queue()
@@ -173,8 +175,9 @@ class Pipeline:
             await self._audio_queue.put(chunk)
 
     async def activate_skill(self, name: str) -> bool:
-        """Activate a skill and broadcast the update."""
-        ok = self._skills.activate(name)
+        """Activate a skill via tool channel and broadcast update."""
+        result = await self._tools.execute("activate_skill", {"skill_name": name})
+        ok = not result.is_error
         if ok:
             await self._send_json({
                 "type": "skill",
@@ -185,8 +188,9 @@ class Pipeline:
         return ok
 
     async def deactivate_skill(self, name: str) -> bool:
-        """Deactivate a skill and broadcast the update."""
-        ok = self._skills.deactivate(name)
+        """Deactivate a skill via tool channel and broadcast update."""
+        result = await self._tools.execute("deactivate_skill", {"skill_name": name})
+        ok = not result.is_error
         if ok:
             await self._send_json({
                 "type": "skill",
@@ -295,14 +299,14 @@ class Pipeline:
             await self._send_connection_status("tts", "disconnected")
             await self._send_connection_status("llm", "disconnected")
             for task in [self._audio_forward_task, self._transcript_task]:
-                if task and not task.done():
+                if not task:
+                    continue
+                if not task.done():
                     task.cancel()
-            for task in [self._audio_forward_task, self._transcript_task]:
-                if task:
-                    try:
-                        await task
-                    except asyncio.CancelledError:
-                        pass
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
             await self._asr.close()
             await self._set_state("idle")
             logger.info("Session loop finished")
@@ -325,18 +329,26 @@ class Pipeline:
             if event.type == "tool_start":
                 tool_calls_count += 1
                 await self._set_state("executing")
+                tool_call_id = str(event.data.get("tool_call_id") or "").strip()
+                if not tool_call_id:
+                    tool_call_id = f"{turn_id}_start_{tool_calls_count}"
                 await self._send_json({
                     "type": "tool",
                     "event": "start",
                     "turn_id": turn_id,
+                    "tool_call_id": tool_call_id,
                     "name": event.data.get("name", ""),
                     "arguments": event.data.get("arguments", {}),
                 })
             elif event.type == "tool_result":
+                tool_call_id = str(event.data.get("tool_call_id") or "").strip()
+                if not tool_call_id:
+                    tool_call_id = f"{turn_id}_result_{tool_calls_count}"
                 await self._send_json({
                     "type": "tool",
                     "event": "result",
                     "turn_id": turn_id,
+                    "tool_call_id": tool_call_id,
                     "name": event.data.get("name", ""),
                     "content": event.data.get("content", ""),
                     "is_error": event.data.get("is_error", False),
@@ -435,11 +447,7 @@ class Pipeline:
                 if llm_first_token_at
                 else None
             )
-            llm_first_token_ms = (
-                int(max(0.0, llm_first_token_at - turn_started_at) * 1000)
-                if llm_first_token_at
-                else None
-            )
+            llm_first_token_ms = thinking_ms
             tts_first_audio_ms = (
                 int(max(0.0, tts_first_audio_at - llm_first_token_at) * 1000)
                 if tts_first_audio_at and llm_first_token_at

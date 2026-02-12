@@ -22,10 +22,6 @@ class Skill:
     path: Path  # directory containing SKILL.md
     metadata: dict[str, str] = field(default_factory=dict)
 
-    @property
-    def short_info(self) -> str:
-        return f"{self.name}: {self.description}"
-
 
 def _parse_skill_md(skill_dir: Path) -> Skill | None:
     """Parse a SKILL.md file from a skill directory."""
@@ -93,12 +89,8 @@ class SkillManager:
         logger.info("Total skills discovered: %d", len(self._all_skills))
         return list(self._all_skills.values())
 
-    @property
     def all_skills(self) -> list[Skill]:
         return list(self._all_skills.values())
-
-    def get_skill(self, name: str) -> Skill | None:
-        return self._all_skills.get(name)
 
     def activate(self, name: str) -> bool:
         """Activate a skill by name. Returns True if successful."""
@@ -117,12 +109,11 @@ class SkillManager:
             return True
         return False
 
+    def is_active(self, name: str) -> bool:
+        return name in self._active
+
     def get_active_skills(self) -> list[Skill]:
         return [self._all_skills[n] for n in self._active if n in self._all_skills]
-
-    @property
-    def active_names(self) -> list[str]:
-        return sorted(self._active)
 
     def build_system_prompt(self, base_prompt: str) -> str:
         """Build a system prompt with skill metadata and active skill instructions injected."""

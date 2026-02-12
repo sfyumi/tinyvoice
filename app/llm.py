@@ -4,34 +4,12 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
 
 from openai import AsyncOpenAI
 
 logger = logging.getLogger("tinyagent.llm")
-
-DEFAULT_SYSTEM_PROMPT = """你是一个友好的中文语音助手。请用简洁、口语化的中文回复，适合语音播报。回复尽量短一些，一两句话为宜。"""
-
-AGENT_INSTRUCTIONS = """\
-<agent_instructions>
-你是一个强大的语音智能体。你具备以下能力：
-1. 使用工具来获取实时信息、执行计算、搜索互联网、读写文件等。
-2. 动态加载和使用技能（Skills）来增强特定领域的能力。
-3. 回忆过去的对话（recall_memory）和记录用户信息（update_user_profile）。
-4. 用简洁、口语化的中文回复，适合语音播报。
-
-重要规则：
-- 回复要简洁自然，适合语音朗读。不要使用 markdown 格式、代码块或特殊符号。
-- 当需要获取实时信息（时间、天气、新闻等）时，主动使用对应工具。
-- 当用户的请求涉及特定领域时，考虑激活相应技能。
-- 工具调用的结果要自然地融入回复中，而不是直接念出原始数据。
-- 如果工具调用失败，简要告知用户并提供替代方案。
-- 当你了解到用户的重要信息（姓名、偏好、兴趣等）时，用 update_user_profile 记录下来。
-- 当用户提到过去的对话或你需要上下文时，用 recall_memory 查看记忆。
-</agent_instructions>
-"""
 
 
 @dataclass
@@ -48,8 +26,8 @@ class LLMResponse:
     """Structured response from the LLM, can be text or tool calls."""
 
     text: str = ""
+    tokens: list[str] = field(default_factory=list)
     tool_calls: list[ToolCall] = field(default_factory=list)
-    finish_reason: str = ""
 
     @property
     def has_tool_calls(self) -> bool:
@@ -62,7 +40,7 @@ class LLMClient:
         base_url: str,
         api_key: str,
         model: str,
-        system_prompt: str = DEFAULT_SYSTEM_PROMPT,
+        system_prompt: str = "",
     ) -> None:
         self._client = AsyncOpenAI(base_url=base_url, api_key=api_key)
         self._model = model
@@ -112,51 +90,31 @@ class LLMClient:
             }
         )
 
-    def clear_history(self) -> None:
-        self._history.clear()
-
-    def get_messages_for_api(self) -> list[dict[str, Any]]:
+    def _get_messages_for_api(self) -> list[dict[str, Any]]:
         return [
             {"role": "system", "content": self._system_prompt},
             *self._history,
         ]
 
-    async def stream_chat(self, user_text: str) -> AsyncIterator[str]:
-        """Simple text-only streaming (backward compatible)."""
-        self.add_user_message(user_text)
-        messages = self.get_messages_for_api()
-        full_content: list[str] = []
-        stream = await self._client.chat.completions.create(
-            model=self._model,
-            messages=messages,
-            stream=True,
-        )
-        async for chunk in stream:
-            if not chunk.choices:
-                continue
-            delta = chunk.choices[0].delta
-            if delta and getattr(delta, "content", None):
-                full_content.append(delta.content)
-                yield delta.content
-        reply = "".join(full_content)
-        if reply:
-            self.add_assistant_message(reply)
-
     async def stream_chat_with_tools(
         self,
         tools: list[dict[str, Any]] | None = None,
-        on_text_delta: Any | None = None,
     ) -> LLMResponse:
         """Stream a chat completion that may include tool calls.
 
+        This method handles the NORMAL agent loop case: tools are available and
+        the model freely decides whether to call them or reply with text.
+
+        For forcing a text-only response (after max tool rounds), use
+        ``stream_text_only`` instead.
+
         Args:
-            tools: OpenAI-format tool definitions. Pass None to disable tools.
-            on_text_delta: async callback(token: str) called for each text token.
+            tools: OpenAI-format tool definitions. Pass None or [] to disable tools.
 
         Returns:
             LLMResponse with either text content or tool_calls.
         """
-        messages = self.get_messages_for_api()
+        messages = self._get_messages_for_api()
         kwargs: dict[str, Any] = {
             "model": self._model,
             "messages": messages,
@@ -168,10 +126,9 @@ class LLMClient:
 
         stream = await self._client.chat.completions.create(**kwargs)
 
-        full_text: list[str] = []
+        tokens: list[str] = []
         # Accumulate tool calls from streaming deltas
         tool_call_accum: dict[int, dict[str, Any]] = {}
-        finish_reason = ""
 
         async for chunk in stream:
             if not chunk.choices:
@@ -179,18 +136,12 @@ class LLMClient:
             choice = chunk.choices[0]
             delta = choice.delta
 
-            # Capture finish reason
-            if choice.finish_reason:
-                finish_reason = choice.finish_reason
-
             # Text content
-            if delta and getattr(delta, "content", None):
-                full_text.append(delta.content)
-                if on_text_delta:
-                    await on_text_delta(delta.content)
+            if delta and delta.content:
+                tokens.append(delta.content)
 
             # Tool calls (streamed incrementally)
-            if delta and getattr(delta, "tool_calls", None):
+            if delta and delta.tool_calls:
                 for tc_delta in delta.tool_calls:
                     idx = tc_delta.index
                     if idx not in tool_call_accum:
@@ -210,8 +161,8 @@ class LLMClient:
 
         # Build response
         response = LLMResponse(
-            text="".join(full_text),
-            finish_reason=finish_reason,
+            text="".join(tokens),
+            tokens=tokens,
         )
 
         # Parse accumulated tool calls
@@ -233,3 +184,98 @@ class LLMClient:
             self.add_assistant_message(response.text)
 
         return response
+
+    # ------------------------------------------------------------------
+    # Text-only fallback (used after max tool rounds are exhausted)
+    # ------------------------------------------------------------------
+
+    def _build_text_only_messages(self) -> list[dict[str, Any]]:
+        """Return a copy of the conversation with tool messages converted to
+        plain text so that a regular (non-tool) chat completion can be used.
+
+        * ``assistant`` messages with ``tool_calls`` → ``"[调用工具] ..."``
+        * ``tool`` result messages → ``"[tool_name 返回] ..."``
+        * Consecutive same-role messages are merged (some providers reject them).
+        """
+        messages = self._get_messages_for_api()
+        converted: list[dict[str, Any]] = []
+        for m in messages:
+            if "tool_calls" in m:
+                calls = m["tool_calls"]
+                descs = []
+                for tc in calls:
+                    f = tc.get("function", {})
+                    descs.append(
+                        f"{f.get('name', '')}({f.get('arguments', '')})"
+                    )
+                converted.append({
+                    "role": "assistant",
+                    "content": "[调用工具] " + ", ".join(descs),
+                })
+            elif m.get("role") == "tool":
+                converted.append({
+                    "role": "assistant",
+                    "content": f"[{m.get('name', '')} 返回] {m.get('content', '')}",
+                })
+            else:
+                converted.append(m)
+
+        # Merge consecutive same-role messages
+        merged: list[dict[str, Any]] = []
+        for msg in converted:
+            if (
+                merged
+                and merged[-1]["role"] == msg["role"]
+                and msg["role"] != "system"
+            ):
+                merged[-1]["content"] = (
+                    (merged[-1].get("content") or "")
+                    + "\n"
+                    + (msg.get("content") or "")
+                )
+            else:
+                merged.append(dict(msg))
+        return merged
+
+    async def stream_text_only(
+        self,
+        nudge: str | None = None,
+    ) -> LLMResponse:
+        """Force a text-only response.
+
+        * Adds an optional *nudge* user message (e.g. "请直接回复").
+        * Converts the full history (including tool calls / results) to plain
+          text so the model keeps context but the API sees no tool format.
+        * Sends a plain ``chat.completions`` request — **no** ``tools``,
+          **no** ``tool_choice`` — so the provider cannot raise
+          "tool_choice is none but model called a tool".
+        * On any API error, falls back to a canned reply so the user always
+          gets *something*.
+        """
+        if nudge:
+            self.add_user_message(nudge)
+
+        messages = self._build_text_only_messages()
+        full_text: list[str] = []
+
+        try:
+            stream = await self._client.chat.completions.create(
+                model=self._model,
+                messages=messages,
+                stream=True,
+            )
+            async for chunk in stream:
+                if not chunk.choices:
+                    continue
+                delta = chunk.choices[0].delta
+                if delta and delta.content:
+                    full_text.append(delta.content)
+        except Exception as exc:
+            logger.warning("Text-only LLM call failed (%s), using fallback", exc)
+            fallback = "抱歉，让我整理一下。我刚才查到了一些信息但处理过程中出了点问题，请再问我一次吧。"
+            full_text = [fallback]
+
+        text = "".join(full_text)
+        if text:
+            self.add_assistant_message(text)
+        return LLMResponse(text=text, tokens=full_text)
