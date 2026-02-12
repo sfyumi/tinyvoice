@@ -1,0 +1,40 @@
+---
+description: TinyVoice architecture overview - ASR/LLM/TTS pipeline, state machine, WebSocket protocol
+alwaysApply: true
+---
+
+# TinyVoice Architecture Rule
+
+## Core Pipeline
+- Keep the runtime flow as ASR (Soniox) -> LLM (OpenAI-compatible) -> TTS (Qwen DashScope).
+- Preserve Chinese-first voice interaction and short spoken responses.
+
+## State Machine
+- The main pipeline state is `idle -> listening -> thinking -> speaking`.
+- `start_session` enters `listening`; `interrupt` during `speaking` returns to `listening`.
+- Always publish state changes to the frontend via WebSocket JSON.
+
+## ASR Boundary Rules
+- Soniox `<end>` token is the semantic endpoint of one utterance.
+- Build sentence from final tokens only, call `_on_sentence(sentence)` on endpoint, then clear per-utterance token buffer.
+- Stream interim/final transcript text to frontend continuously.
+
+## TTS Integration Rules
+- DashScope realtime TTS SDK remains sync; bridge via `threading.Thread` and `queue.Queue`.
+- Stream LLM text chunks into TTS input; stream PCM chunks back to client.
+- TTS supports mid-stream cancellation via `TTSClient.cancel()`: sends `cancel_response` to DashScope, closes WebSocket, and signals a shared `threading.Event` so the sync thread exits cleanly.
+
+## Interrupt / Barge-in Rules
+- On interrupt, call `tts.cancel()` **before** cancelling the turn task to stop DashScope synthesis immediately.
+- The `cancel_event` (`threading.Event`) coordinates cancellation across async pipeline code and the sync TTS thread.
+- After cancel, the TTS thread must not call `client.finish()` or wait for synthesis completion.
+
+## Audio And Transport
+- Mic capture format is 16kHz PCM s16le mono from AudioWorklet.
+- TTS output is 24kHz PCM mono; frontend resamples to browser `AudioContext` sample rate.
+- WebSocket multiplexing: JSON for control/text events, binary for audio frames.
+
+## Config And Reliability
+- Load all env vars with `pydantic-settings` in `app/config.py`.
+- Access settings through cached `get_settings()` (`lru_cache`).
+- Keep robust disconnect/error handling and logging in WebSocket and pipeline tasks.

@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>TinyVoice - 实时语音对话</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="/static/style.css" />
+  </head>
+  <body class="bg-slate-100 text-slate-800">
+    <div class="mx-auto flex min-h-screen w-full max-w-5xl flex-col p-4">
+      <header class="mb-4 rounded-xl bg-white p-4 shadow-sm">
+        <div class="flex items-center justify-between">
+          <div>
+            <h1 class="text-xl font-semibold">TinyVoice 语音 Agent</h1>
+            <p class="text-sm text-slate-500">ASR → LLM → TTS 实时对话</p>
+          </div>
+          <div class="flex items-center gap-2">
+            <span id="stateDot" class="state-dot idle"></span>
+            <span id="stateText" class="text-sm font-medium">idle</span>
+          </div>
+        </div>
+      </header>
+
+      <main class="grid flex-1 grid-cols-1 gap-4 lg:grid-cols-[2fr_1fr]">
+        <section class="rounded-xl bg-white p-4 shadow-sm">
+          <div id="chat" class="chat-box"></div>
+        </section>
+
+        <aside class="rounded-xl bg-white p-4 shadow-sm">
+          <div class="space-y-3 diagnostics">
+            <details open>
+              <summary>控制</summary>
+              <div class="mt-3 space-y-3">
+                <button
+                  id="startBtn"
+                  class="w-full rounded-lg bg-blue-600 px-4 py-2 font-medium text-white hover:bg-blue-700"
+                >
+                  开始会话
+                </button>
+                <button
+                  id="stopBtn"
+                  class="w-full rounded-lg bg-slate-700 px-4 py-2 font-medium text-white hover:bg-slate-800"
+                >
+                  结束会话
+                </button>
+                <button
+                  id="interruptBtn"
+                  class="w-full rounded-lg bg-amber-500 px-4 py-2 font-medium text-white hover:bg-amber-600"
+                >
+                  打断播报
+                </button>
+                <div>
+                  <label class="mb-1 block text-sm text-slate-600">麦克风电平</label>
+                  <div class="h-2 w-full rounded-full bg-slate-200">
+                    <div id="levelBar" class="h-2 rounded-full bg-emerald-500" style="width: 0%"></div>
+                  </div>
+                </div>
+              </div>
+            </details>
+
+            <details open>
+              <summary>延迟指标（上一轮）</summary>
+              <div class="mt-3 space-y-2 text-sm">
+                <div>
+                  <div class="mb-1 text-xs text-slate-500">阶段耗时分布</div>
+                  <div class="stage-bar">
+                    <div id="stageListening" class="seg listening" style="width: 0%"></div>
+                    <div id="stageThinking" class="seg thinking" style="width: 0%"></div>
+                    <div id="stageSpeaking" class="seg speaking" style="width: 0%"></div>
+                  </div>
+                  <div class="metric-row mt-1 text-xs text-slate-500">
+                    <span id="stageListeningLabel">L: -</span>
+                    <span id="stageThinkingLabel">T: -</span>
+                    <span id="stageSpeakingLabel">S: -</span>
+                  </div>
+                </div>
+                <div class="metric-row"><span>用户语音时长</span><span id="mAsrEndpoint" class="metric-chip">-</span></div>
+                <div class="metric-row"><span>LLM 首 Token (TTFT)</span><span id="mLlmFirst" class="metric-chip">-</span></div>
+                <div class="metric-row"><span>TTS 首音频</span><span id="mTtsFirst" class="metric-chip">-</span></div>
+                <div class="metric-row"><span>端到端</span><span id="mE2E" class="metric-chip">-</span></div>
+              </div>
+            </details>
+
+            <details open>
+              <summary>当前 Turn</summary>
+              <div class="mt-3 space-y-2 text-sm">
+                <div class="metric-row"><span>LLM Tokens</span><span id="liveLlmTokens">0</span></div>
+                <div class="metric-row"><span>LLM 速率</span><span id="liveLlmRate">0 tok/s</span></div>
+                <div class="metric-row"><span>TTS Chunks</span><span id="liveTtsChunks">0</span></div>
+                <div class="metric-row"><span>估算音频</span><span id="liveTtsDuration">0 ms</span></div>
+                <div class="metric-row"><span>Listening 时长</span><span id="liveListeningDuration">0 ms</span></div>
+              </div>
+            </details>
+
+            <details open>
+              <summary>连接状态</summary>
+              <div class="mt-3 space-y-2 text-sm">
+                <div class="metric-row"><span>WebSocket</span><span id="connWs" class="conn-badge unknown">unknown</span></div>
+                <div class="metric-row"><span>ASR</span><span id="connAsr" class="conn-badge unknown">unknown</span></div>
+                <div class="metric-row"><span>LLM</span><span id="connLlm" class="conn-badge unknown">unknown</span></div>
+                <div class="metric-row"><span>TTS</span><span id="connTts" class="conn-badge unknown">unknown</span></div>
+                <div class="metric-row"><span>已连接时长</span><span id="wsUptime">0s</span></div>
+              </div>
+            </details>
+
+            <details open>
+              <summary>会话统计</summary>
+              <div class="mt-3 space-y-2 text-sm">
+                <div class="metric-row"><span>会话时长</span><span id="sessionDuration">0s</span></div>
+                <div class="metric-row"><span>总 Turns</span><span id="sessionTurns">0</span></div>
+                <div class="metric-row"><span>平均端到端</span><span id="sessionAvgE2E">-</span></div>
+                <div class="metric-row"><span>总 LLM Tokens</span><span id="sessionTokens">0</span></div>
+                <div class="metric-row"><span>总 TTS 音频</span><span id="sessionTtsDuration">0 ms</span></div>
+              </div>
+            </details>
+
+            <details>
+              <summary>配置信息</summary>
+              <div class="mt-3 space-y-2 text-xs text-slate-600">
+                <div class="metric-row"><span>LLM Model</span><span id="cfgLlmModel">-</span></div>
+                <div class="metric-row"><span>TTS Model</span><span id="cfgTtsModel">-</span></div>
+                <div class="metric-row"><span>TTS Voice</span><span id="cfgTtsVoice">-</span></div>
+                <div class="metric-row"><span>LLM Endpoint</span><span id="cfgLlmBaseUrl">-</span></div>
+                <div class="metric-row"><span>ASR Endpoint</span><span id="cfgSonioxWsUrl">-</span></div>
+                <div class="metric-row"><span>TTS Endpoint</span><span id="cfgTtsWsUrl">-</span></div>
+                <div class="metric-row"><span>ASR Config</span><span id="cfgAsrReady">-</span></div>
+                <div class="metric-row"><span>LLM Config</span><span id="cfgLlmReady">-</span></div>
+                <div class="metric-row"><span>TTS Config</span><span id="cfgTtsReady">-</span></div>
+              </div>
+            </details>
+          </div>
+        </aside>
+      </main>
+    </div>
+
+    <script type="module" src="/static/app.js"></script>
+  </body>
+</html>

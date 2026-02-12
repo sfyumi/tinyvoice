@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+websockets
+openai
+dashscope>=1.23.9
+pydantic
+pydantic-settings
+python-dotenv
+numpy
+python-socks
