@@ -1,3 +1,5 @@
+/* TinyAgent - Frontend with Soul + Skills + Tools support */
+
 const chatEl = document.getElementById("chat");
 const startBtn = document.getElementById("startBtn");
 const stopBtn = document.getElementById("stopBtn");
@@ -22,6 +24,7 @@ const liveLlmRate = document.getElementById("liveLlmRate");
 const liveTtsChunks = document.getElementById("liveTtsChunks");
 const liveTtsDuration = document.getElementById("liveTtsDuration");
 const liveListeningDuration = document.getElementById("liveListeningDuration");
+const liveToolCalls = document.getElementById("liveToolCalls");
 
 const connWs = document.getElementById("connWs");
 const connAsr = document.getElementById("connAsr");
@@ -34,6 +37,7 @@ const sessionTurns = document.getElementById("sessionTurns");
 const sessionAvgE2E = document.getElementById("sessionAvgE2E");
 const sessionTokens = document.getElementById("sessionTokens");
 const sessionTtsDuration = document.getElementById("sessionTtsDuration");
+const sessionToolCalls = document.getElementById("sessionToolCalls");
 
 const cfgLlmModel = document.getElementById("cfgLlmModel");
 const cfgTtsModel = document.getElementById("cfgTtsModel");
@@ -44,6 +48,15 @@ const cfgTtsWsUrl = document.getElementById("cfgTtsWsUrl");
 const cfgAsrReady = document.getElementById("cfgAsrReady");
 const cfgLlmReady = document.getElementById("cfgLlmReady");
 const cfgTtsReady = document.getElementById("cfgTtsReady");
+const cfgTools = document.getElementById("cfgTools");
+
+const skillsList = document.getElementById("skillsList");
+const skillCount = document.getElementById("skillCount");
+const toolLog = document.getElementById("toolLog");
+const soulStatus = document.getElementById("soulStatus");
+const soulLoaded = document.getElementById("soulLoaded");
+const userLoaded = document.getElementById("userLoaded");
+const memoryEntries = document.getElementById("memoryEntries");
 
 let ws = null;
 let audioCtx = null;
@@ -64,9 +77,13 @@ let wsConnectedAt = 0;
 let sessionStartedAt = 0;
 let listeningStartedAt = 0;
 let tickTimer = null;
-let liveTurn = { llmTokens: 0, llmRate: 0, ttsChunks: 0, ttsDurationMs: 0, listeningMs: 0 };
-let sessionStats = { turns: 0, sumE2E: 0, totalTokens: 0, totalTtsMs: 0 };
+let liveTurn = { llmTokens: 0, llmRate: 0, ttsChunks: 0, ttsDurationMs: 0, listeningMs: 0, toolCalls: 0 };
+let sessionStats = { turns: 0, sumE2E: 0, totalTokens: 0, totalTtsMs: 0, totalToolCalls: 0 };
+let currentSkills = [];
+let toolLogEntries = [];
+let activeToolBubbles = {};
 
+// ---- Bubble helpers ----
 function addBubble(role, text) {
   const div = document.createElement("div");
   div.className = `bubble ${role}`;
@@ -76,6 +93,59 @@ function addBubble(role, text) {
   return div;
 }
 
+function addToolBubble(toolCallId, name, args) {
+  const div = document.createElement("div");
+  div.className = "bubble tool";
+  const argsStr = typeof args === "object" ? Object.entries(args).map(([k, v]) => `${k}: ${typeof v === "string" ? v : JSON.stringify(v)}`).join(", ") : String(args);
+  div.innerHTML = `
+    <div class="tool-header">
+      <div class="tool-spinner"></div>
+      <span>${name}</span>
+      <span class="tool-time">执行中...</span>
+    </div>
+    <div class="tool-args" style="font-size:11px;color:#64748b;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${argsStr}</div>
+  `;
+  chatEl.appendChild(div);
+  chatEl.scrollTop = chatEl.scrollHeight;
+  activeToolBubbles[toolCallId] = div;
+  return div;
+}
+
+function updateToolBubble(toolCallId, content, isError, elapsedMs) {
+  const div = activeToolBubbles[toolCallId];
+  if (!div) return;
+  // Remove spinner
+  const spinner = div.querySelector(".tool-spinner");
+  if (spinner) spinner.remove();
+  // Update time
+  const timeEl = div.querySelector(".tool-time");
+  if (timeEl) timeEl.textContent = `${elapsedMs}ms`;
+  // Add result
+  const resultDiv = document.createElement("div");
+  resultDiv.className = `tool-result ${isError ? "error" : ""}`;
+  const maxLen = 150;
+  const short = content.length > maxLen ? content.slice(0, maxLen) + "..." : content;
+  resultDiv.textContent = isError ? `错误: ${short}` : short;
+  div.appendChild(resultDiv);
+  // Mark done
+  const header = div.querySelector(".tool-header span:not(.tool-time)");
+  if (header && !isError) header.classList.add("tool-done");
+  chatEl.scrollTop = chatEl.scrollHeight;
+  delete activeToolBubbles[toolCallId];
+}
+
+function addSkillChangeBubble(action, name) {
+  const text = action === "activate_skill" || action === "activated"
+    ? `已激活技能: ${name}`
+    : `已停用技能: ${name}`;
+  const div = document.createElement("div");
+  div.className = "bubble skill-change";
+  div.textContent = text;
+  chatEl.appendChild(div);
+  chatEl.scrollTop = chatEl.scrollHeight;
+}
+
+// ---- Format helpers ----
 function formatMs(ms) {
   if (typeof ms !== "number" || Number.isNaN(ms)) return "-";
   if (ms < 1000) return `${Math.round(ms)} ms`;
@@ -122,6 +192,7 @@ function maskUrl(url) {
   }
 }
 
+// ---- Stage Bar ----
 function renderStageBar(listeningMs, thinkingMs, speakingMs) {
   const l = typeof listeningMs === "number" ? Math.max(0, listeningMs) : 0;
   const t = typeof thinkingMs === "number" ? Math.max(0, thinkingMs) : 0;
@@ -146,18 +217,21 @@ function renderStageBar(listeningMs, thinkingMs, speakingMs) {
   stageSpeakingLabel.textContent = `S: ${formatMs(s)}`;
 }
 
+// ---- Live Turn & Session Stats ----
 function renderLiveTurn() {
   liveLlmTokens.textContent = String(liveTurn.llmTokens);
   liveLlmRate.textContent = `${liveTurn.llmRate.toFixed(2)} tok/s`;
   liveTtsChunks.textContent = String(liveTurn.ttsChunks);
   liveTtsDuration.textContent = formatMs(liveTurn.ttsDurationMs);
   liveListeningDuration.textContent = formatMs(liveTurn.listeningMs);
+  liveToolCalls.textContent = String(liveTurn.toolCalls);
 }
 
 function renderSessionStats() {
   sessionTurns.textContent = String(sessionStats.turns);
   sessionTokens.textContent = String(sessionStats.totalTokens);
   sessionTtsDuration.textContent = formatMs(sessionStats.totalTtsMs);
+  sessionToolCalls.textContent = String(sessionStats.totalToolCalls);
   if (sessionStats.turns > 0) {
     sessionAvgE2E.textContent = formatMs(sessionStats.sumE2E / sessionStats.turns);
   } else {
@@ -187,7 +261,7 @@ function startTicker() {
 }
 
 function resetLiveTurn() {
-  liveTurn = { llmTokens: 0, llmRate: 0, ttsChunks: 0, ttsDurationMs: 0, listeningMs: 0 };
+  liveTurn = { llmTokens: 0, llmRate: 0, ttsChunks: 0, ttsDurationMs: 0, listeningMs: 0, toolCalls: 0 };
   renderLiveTurn();
 }
 
@@ -202,6 +276,74 @@ function updateState(state) {
   }
 }
 
+// ---- Skills Panel ----
+function renderSkills(skills) {
+  currentSkills = skills || [];
+  skillCount.textContent = `${currentSkills.length} 可用`;
+  if (currentSkills.length === 0) {
+    skillsList.innerHTML = '<div class="text-xs text-slate-400">没有可用技能</div>';
+    return;
+  }
+  skillsList.innerHTML = "";
+  for (const s of currentSkills) {
+    const item = document.createElement("div");
+    item.className = `skill-item ${s.active ? "active" : ""}`;
+    item.innerHTML = `
+      <div style="flex:1;min-width:0;">
+        <div class="skill-name">${s.name}</div>
+        <div class="skill-desc">${s.description}</div>
+      </div>
+      <div class="skill-toggle"></div>
+    `;
+    item.addEventListener("click", () => {
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      const action = s.active ? "deactivate_skill" : "activate_skill";
+      ws.send(JSON.stringify({ type: action, name: s.name }));
+    });
+    skillsList.appendChild(item);
+  }
+}
+
+// ---- Soul Status ----
+function renderSoulInfo(soul) {
+  if (!soul) return;
+  soulLoaded.textContent = soul.soul_loaded ? `已加载 (${soul.soul_chars} 字)` : "未找到";
+  soulLoaded.style.color = soul.soul_loaded ? "#059669" : "#94a3b8";
+  userLoaded.textContent = soul.user_loaded ? `已加载 (${soul.user_chars} 字)` : "未找到";
+  userLoaded.style.color = soul.user_loaded ? "#059669" : "#94a3b8";
+  memoryEntries.textContent = String(soul.memory_entries);
+  const parts = [];
+  if (soul.soul_loaded) parts.push("Soul");
+  if (soul.user_loaded) parts.push("User");
+  if (soul.memory_entries > 0) parts.push(`${soul.memory_entries} 记忆`);
+  soulStatus.textContent = parts.length > 0 ? parts.join(" + ") : "未配置";
+}
+
+// ---- Tool Log ----
+function addToolLogEntry(name, isError, content, elapsedMs) {
+  if (toolLogEntries.length === 0) {
+    toolLog.innerHTML = "";
+  }
+  const entry = { name, isError, content, elapsedMs, time: new Date() };
+  toolLogEntries.push(entry);
+  if (toolLogEntries.length > 20) toolLogEntries.shift();
+
+  const div = document.createElement("div");
+  div.className = `tool-log-entry ${isError ? "error" : ""}`;
+  const maxLen = 60;
+  const short = content.length > maxLen ? content.slice(0, maxLen) + "..." : content;
+  div.innerHTML = `
+    <div class="tool-log-body">
+      <span class="tool-log-name">${name}</span>
+      <span style="color:#94a3b8;margin-left:4px;">${elapsedMs}ms</span>
+      <div class="tool-log-content">${short}</div>
+    </div>
+  `;
+  toolLog.appendChild(div);
+  toolLog.scrollTop = toolLog.scrollHeight;
+}
+
+// ---- Audio ----
 function pcm16ToFloat32(int16Array) {
   const out = new Float32Array(int16Array.length);
   for (let i = 0; i < int16Array.length; i += 1) {
@@ -338,13 +480,14 @@ async function initAudio() {
     if (ws && ws.readyState === WebSocket.OPEN && data instanceof ArrayBuffer) {
       sentAudioChunks += 1;
       if (sentAudioChunks % 50 === 0) {
-        console.info("[tinyvoice] sent mic audio chunks:", sentAudioChunks);
+        console.info("[tinyagent] sent mic audio chunks:", sentAudioChunks);
       }
       ws.send(data);
     }
   };
 }
 
+// ---- Server message handler ----
 function handleServerMessage(msg) {
   if (msg.type === "state") {
     updateState(msg.state);
@@ -370,6 +513,15 @@ function handleServerMessage(msg) {
     cfgAsrReady.textContent = msg.asr_configured ? "ready" : "missing";
     cfgLlmReady.textContent = msg.llm_configured ? "ready" : "missing";
     cfgTtsReady.textContent = msg.tts_configured ? "ready" : "missing";
+    if (msg.tools) {
+      cfgTools.textContent = msg.tools.join(", ");
+    }
+    if (msg.skills) {
+      renderSkills(msg.skills);
+    }
+    if (msg.soul) {
+      renderSoulInfo(msg.soul);
+    }
     return;
   }
 
@@ -377,6 +529,40 @@ function handleServerMessage(msg) {
     if (msg.service === "asr") setConnBadge(connAsr, msg.status, msg.detail || "");
     if (msg.service === "llm") setConnBadge(connLlm, msg.status, msg.detail || "");
     if (msg.service === "tts") setConnBadge(connTts, msg.status, msg.detail || "");
+    return;
+  }
+
+  // Skills list update
+  if (msg.type === "skills_list") {
+    renderSkills(msg.skills);
+    return;
+  }
+
+  // Skill change event
+  if (msg.type === "skill") {
+    if (msg.skills) renderSkills(msg.skills);
+    if (msg.event && msg.name) {
+      addSkillChangeBubble(msg.event, msg.name);
+    }
+    return;
+  }
+
+  // Tool events
+  if (msg.type === "tool") {
+    if (msg.event === "start") {
+      liveTurn.toolCalls += 1;
+      renderLiveTurn();
+      addToolBubble(msg.turn_id + "_" + msg.name, msg.name, msg.arguments || {});
+    }
+    if (msg.event === "result") {
+      updateToolBubble(
+        msg.turn_id + "_" + msg.name,
+        msg.content || "",
+        msg.is_error || false,
+        msg.elapsed_ms || 0
+      );
+      addToolLogEntry(msg.name, msg.is_error, msg.content || "", msg.elapsed_ms || 0);
+    }
     return;
   }
 
@@ -392,11 +578,13 @@ function handleServerMessage(msg) {
     liveTurn.listeningMs = msg.listening_duration_ms || 0;
     if (typeof msg.llm_tokens === "number") liveTurn.llmTokens = msg.llm_tokens;
     if (typeof msg.llm_tok_per_sec === "number") liveTurn.llmRate = msg.llm_tok_per_sec;
+    if (typeof msg.tool_calls === "number") liveTurn.toolCalls = msg.tool_calls;
     renderLiveTurn();
 
     sessionStats.turns += 1;
     sessionStats.totalTokens += msg.llm_tokens || 0;
     sessionStats.totalTtsMs += msg.tts_est_duration_ms || 0;
+    sessionStats.totalToolCalls += msg.tool_calls || 0;
     if (typeof msg.e2e_latency_ms === "number") {
       sessionStats.sumE2E += msg.e2e_latency_ms;
     }
@@ -481,6 +669,7 @@ function handleServerMessage(msg) {
   }
 }
 
+// ---- WebSocket ----
 function connectWebSocket() {
   const proto = window.location.protocol === "https:" ? "wss" : "ws";
   ws = new WebSocket(`${proto}://${window.location.host}/ws`);
@@ -489,19 +678,19 @@ function connectWebSocket() {
   ws.onopen = () => {
     wsConnectedAt = Date.now();
     setConnBadge(connWs, "connected");
-    console.info("[tinyvoice] ws open");
+    console.info("[tinyagent] ws open");
     addBubble("system", "WebSocket 已连接");
     startTicker();
   };
   ws.onclose = (event) => {
     wsConnectedAt = 0;
     setConnBadge(connWs, "disconnected");
-    console.warn("[tinyvoice] ws close", event.code, event.reason);
+    console.warn("[tinyagent] ws close", event.code, event.reason);
     addBubble("system", "WebSocket 已断开");
   };
   ws.onerror = (event) => {
     setConnBadge(connWs, "error");
-    console.error("[tinyvoice] ws error", event);
+    console.error("[tinyagent] ws error", event);
     addBubble("system", "WebSocket 错误");
   };
   ws.onmessage = (event) => {
@@ -517,7 +706,7 @@ function connectWebSocket() {
     if (event.data instanceof ArrayBuffer && playbackNode && audioCtx) {
       recvAudioChunks += 1;
       if (recvAudioChunks % 20 === 0) {
-        console.info("[tinyvoice] recv tts audio chunks:", recvAudioChunks);
+        console.info("[tinyagent] recv tts audio chunks:", recvAudioChunks);
       }
       const pcm16 = new Int16Array(event.data);
       const float24k = pcm16ToFloat32(pcm16);
@@ -527,6 +716,7 @@ function connectWebSocket() {
   };
 }
 
+// ---- Button handlers ----
 startBtn.addEventListener("click", async () => {
   await initAudio();
   if (!ws || ws.readyState !== WebSocket.OPEN) {
@@ -536,9 +726,9 @@ startBtn.addEventListener("click", async () => {
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ type: "start_session" }));
     sessionStartedAt = Date.now();
-    sessionStats = { turns: 0, sumE2E: 0, totalTokens: 0, totalTtsMs: 0 };
+    sessionStats = { turns: 0, sumE2E: 0, totalTokens: 0, totalTtsMs: 0, totalToolCalls: 0 };
     renderSessionStats();
-    addBubble("system", "会话已开始");
+    addBubble("system", "会话已开始 - TinyAgent (Soul + Skills + Tools)");
   }
 });
 
@@ -556,6 +746,7 @@ interruptBtn.addEventListener("click", () => {
   }
 });
 
+// ---- Init ----
 setConnBadge(connWs, "unknown");
 setConnBadge(connAsr, "unknown");
 setConnBadge(connLlm, "unknown");

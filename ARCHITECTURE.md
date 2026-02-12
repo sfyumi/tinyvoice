@@ -1,133 +1,191 @@
-# TinyVoice Architecture
+# TinyAgent Architecture
 
-TinyVoice is a real-time voice agent built with a three-stage pipeline: ASR -> LLM -> TTS. The browser streams microphone PCM audio to the backend, the backend detects utterance boundaries from ASR semantic endpoints, then streams generated text and synthesized audio back to the browser.
+## One sentence
 
-## System Architecture
+**TinyAgent = Voice Interface + Agent Brain + Persistent Soul**
 
-```mermaid
-flowchart LR
-    BrowserClient["BrowserClient static/app.js"] <--> VoiceWs["FastAPI WebSocket /ws app/main.py"]
-    VoiceWs <--> PipelineCore["Pipeline app/pipeline.py"]
-    PipelineCore <--> SonioxAsr["SonioxASRClient app/asr.py"]
-    PipelineCore <--> OpenAiLlm["LLMClient app/llm.py"]
-    PipelineCore <--> QwenTts["TTSClient app/tts.py"]
-    PipelineCore --> BrowserClient
+A real-time Chinese voice agent that hears you, thinks with tools, and speaks back -- while remembering who it is and who you are across sessions.
+
+## Core Design: Three Layers
+
+```
+┌─────────────────────────────────────────────────┐
+│                  Voice Layer                      │
+│         ASR (Soniox) ◄──► TTS (Qwen)            │
+│     16kHz PCM in         24kHz PCM out           │
+├─────────────────────────────────────────────────┤
+│                  Agent Brain                      │
+│  ┌───────────┐  ┌──────────┐  ┌──────────────┐  │
+│  │ Agent Loop │──│  Tools   │──│   Skills     │  │
+│  │ (LLM +    │  │ 13 built │  │  5 loadable  │  │
+│  │  tool call │  │  -in     │  │  SKILL.md    │  │
+│  │  cycles)  │  │          │  │              │  │
+│  └───────────┘  └──────────┘  └──────────────┘  │
+├─────────────────────────────────────────────────┤
+│               Persistent Soul                     │
+│       SOUL.md        USER.md       MEMORY.md     │
+│     (who I am)    (who you are)  (what we said)  │
+└─────────────────────────────────────────────────┘
 ```
 
-## Pipeline State Machine
+### Layer 1: Voice -- the interface
 
-```mermaid
-stateDiagram-v2
-    [*] --> idle
-    idle --> listening: start_session
-    listening --> thinking: wait_sentence returns text
-    thinking --> speaking: first LLM token and TTS stream starts
-    speaking --> listening: TTS stream finished
-    speaking --> listening: interrupt
-    listening --> idle: stop_session or disconnect
-    thinking --> idle: stop_session or error
-    speaking --> idle: stop_session or disconnect
+Real-time bidirectional voice over a single WebSocket. Browser captures mic audio, streams 16kHz PCM to server. Server sends back 24kHz TTS audio. All JSON control messages multiplexed on the same connection.
+
+- **ASR**: Soniox Realtime STT with semantic endpoint detection
+- **TTS**: Qwen DashScope Realtime with voice cloning support
+- **Barge-in**: user can interrupt at any time; TTS cancels instantly
+
+### Layer 2: Agent Brain -- the intelligence
+
+When the user finishes a sentence, the Agent Brain takes over. It's not a simple "send to LLM, read back the response" -- it's a multi-turn execution loop:
+
+```
+User sentence
+    │
+    ▼
+┌─ Agent Loop (max 5 rounds) ─────────────────┐
+│                                               │
+│   LLM decides: text response? or tool call?   │
+│        │                    │                 │
+│        ▼                    ▼                 │
+│   [text tokens]      [tool_calls]             │
+│        │                    │                 │
+│        ▼                    ▼                 │
+│     → TTS            Execute tools            │
+│                             │                 │
+│                             ▼                 │
+│                    Feed results back to LLM    │
+│                             │                 │
+│                             └──→ next round    │
+└───────────────────────────────────────────────┘
 ```
 
-## End-to-End Turn Sequence
+The LLM autonomously decides which tools to use, chains multiple steps, and only speaks when it has the final answer.
 
-```mermaid
-sequenceDiagram
-    participant Browser as BrowserClient
-    participant Ws as FastApiWs
-    participant Pipe as Pipeline
-    participant Asr as SonioxAsr
-    participant Llm as OpenAiCompatLlm
-    participant Tts as QwenRealtimeTts
+**13 built-in tools:**
 
-    Browser->>Ws: binary PCM16 16kHz chunks
-    Ws->>Pipe: feed_audio(chunk)
-    Pipe->>Asr: send_audio(chunk)
-    Asr-->>Pipe: transcript updates (interim/final)
-    Pipe-->>Ws: {"type":"asr","text":"...","is_final":bool}
-    Ws-->>Browser: ASR text updates
-    Asr-->>Pipe: "<end>" endpoint sentence
-    Pipe->>Pipe: state listening -> thinking
-    Pipe->>Llm: stream_chat(user_text)
-    Llm-->>Pipe: token stream
-    Pipe-->>Ws: {"type":"llm","text":"...","done":false}
-    Pipe->>Tts: stream_speech(llm_text_stream)
-    Tts-->>Pipe: PCM 24kHz chunks
-    Pipe-->>Ws: binary PCM chunks
-    Ws-->>Browser: audio playback data
-    Pipe->>Pipe: state speaking -> listening
+| Tool | What it does |
+|------|-------------|
+| `run_python` | Execute arbitrary Python code |
+| `list_directory` | Explore the file system |
+| `search_files` | Find files by pattern |
+| `read_file` / `write_file` | Read and write files |
+| `web_search` | Search the internet (DuckDuckGo) |
+| `browse_web` | Full browser automation (optional) |
+| `calculate` | Math expressions |
+| `get_datetime` | Current time/date |
+| `recall_memory` | Search conversation history |
+| `update_user_profile` | Learn about the user |
+| `save_note` | Remember important facts |
+| `activate_skill` / `list_skills` | Manage skills |
+
+**5 built-in skills** (Agent Skills standard, SKILL.md):
+
+| Skill | Purpose |
+|-------|---------|
+| `assistant` | Enhanced general conversation |
+| `coder` | Code generation and explanation |
+| `translator` | Multi-language translation |
+| `analyst` | Data analysis and fact-checking |
+| `planner` | Multi-step task decomposition |
+
+### Layer 3: Persistent Soul -- the identity
+
+Inspired by OpenClaw's identity architecture. Three markdown files that persist across sessions:
+
+- **`soul/SOUL.md`** -- Defines who the agent IS. Personality, values, speaking style. Injected into every system prompt. Editable by the user.
+- **`soul/USER.md`** -- What the agent knows about YOU. Updated automatically as the agent learns your name, preferences, interests.
+- **`soul/MEMORY.md`** -- Conversation memory. Session summaries auto-appended. The agent can recall past conversations on demand.
+
+The prompt hierarchy: `Soul → User → Agent Instructions → Active Skills → Tools`.
+
+## State Machine
+
+```
+idle ──start_session──► listening
+                           │
+                      ASR endpoint
+                           │
+                           ▼
+                       thinking ◄──────────────┐
+                           │                    │
+                     LLM responds               │
+                      ┌────┴────┐               │
+                      │         │               │
+                      ▼         ▼               │
+                  speaking   executing          │
+                      │         │               │
+                TTS done    tool result ─────────┘
+                      │
+                      ▼
+                   listening
 ```
 
-## Module Responsibilities
+- **interrupt** works from `speaking` or `executing` → back to `listening`
+- **stop_session** from any state → `idle`
 
-- `app/config.py`
-  - Loads `.env` via `pydantic-settings`.
-  - Exposes `get_settings()` with `lru_cache` to avoid repeated parsing.
-  - Provides readiness checks: `asr_configured()`, `llm_configured()`, `tts_configured()`.
+## Project Structure
 
-- `app/main.py`
-  - Hosts static assets and the `/ws` WebSocket endpoint.
-  - Parses control messages: `start_session`, `stop_session`, `interrupt`.
-  - Forwards binary audio frames to pipeline and handles disconnect/runtime exceptions.
+```
+tinyagent/
+├── app/                    # Backend (Python/FastAPI)
+│   ├── main.py             #   WebSocket server + routing
+│   ├── pipeline.py         #   Session orchestrator + state machine
+│   ├── agent.py            #   Agent loop (LLM + tool cycles)
+│   ├── llm.py              #   LLM client with tool calling
+│   ├── tools.py            #   Tool registry + 13 built-in tools
+│   ├── skills.py           #   Skills engine (Agent Skills spec)
+│   ├── memory.py           #   Soul & memory manager
+│   ├── asr.py              #   Soniox ASR client
+│   ├── tts.py              #   Qwen TTS client
+│   ├── browser.py          #   Browser automation (optional)
+│   └── config.py           #   Settings from .env
+│
+├── soul/                   # Persistent identity (editable)
+│   ├── SOUL.md             #   Agent personality
+│   ├── USER.md             #   User profile (auto-updated)
+│   └── MEMORY.md           #   Conversation memory (auto-appended)
+│
+├── skills/                 # Loadable skills (Agent Skills standard)
+│   ├── assistant/SKILL.md
+│   ├── coder/SKILL.md
+│   ├── translator/SKILL.md
+│   ├── analyst/SKILL.md
+│   └── planner/SKILL.md
+│
+├── static/                 # Frontend (vanilla JS)
+│   ├── index.html
+│   ├── app.js
+│   └── style.css
+│
+└── refdoc/                 # Reference documentation
+```
 
-- `app/pipeline.py`
-  - Owns session lifecycle and state machine: `idle`, `listening`, `thinking`, `speaking`.
-  - Runs ASR forwarder tasks (audio input + transcript output) and per-turn LLM/TTS task.
-  - Handles interruption by cancelling TTS synthesis first (`tts.cancel()`) then cancelling the turn task, ensuring the DashScope thread exits cleanly instead of leaking.
+## Key Design Decisions
 
-- `app/asr.py`
-  - Connects to Soniox realtime ASR WebSocket with endpoint detection enabled.
-  - Maintains per-utterance `current_tokens`; when `<end>` arrives, emits `_on_sentence(...)` and clears buffer.
-  - Emits transcript updates for frontend display and includes proxy fallback logic.
+**Why voice-first, not text-first?**
+Text agents are commodity. Voice changes the interaction model: hands-free, eyes-free, conversational pace. The constraint of speaking forces conciseness and clarity.
 
-- `app/llm.py`
-  - Uses `AsyncOpenAI` in OpenAI-compatible mode (`base_url`, `api_key`, `model`).
-  - Streams assistant tokens and keeps conversation history with a Chinese speech-friendly system prompt.
+**Why Soul files instead of database?**
+Markdown files are human-readable, git-trackable, and editable with any text editor. No database to manage. The user can open SOUL.md and change the agent's personality in 30 seconds.
 
-- `app/tts.py`
-  - Wraps sync DashScope realtime TTS SDK in a background thread.
-  - Uses `queue.Queue` for text/audio bridging and yields PCM chunks asynchronously.
-  - Uses cloned voice via `TTS_VOICE_ID`.
-  - Supports mid-stream cancellation: `cancel()` sends `cancel_response` to DashScope and closes the WebSocket, stopping synthesis immediately. A shared `threading.Event` coordinates cancellation across the async caller and the sync TTS thread.
+**Why built-in tools instead of MCP/plugins?**
+Each tool is 40-60 lines of Python, zero external dependencies (except optional browser-use). No process management, no protocol translation, no Node.js. When you need it, `run_python` can do anything Python can do.
 
-- `static/app.js`
-  - Captures microphone audio with AudioWorklet and downsamples to 16kHz PCM for ASR.
-  - Plays returned TTS PCM by converting int16 -> float32 and resampling 24kHz to `AudioContext` rate.
-  - Renders streaming ASR/LLM text and sends WebSocket control messages.
+**Why Skills as markdown, not code?**
+Skills are LLM instructions, not executable code. They're safe, portable, and anyone can write one. The LLM's tool-calling ability provides the execution layer.
 
-## WebSocket Protocol
+## Tech Stack
 
-Browser -> Server:
-- Binary frame: microphone PCM audio.
-- JSON control:
-  - `{"type":"start_session"}`
-  - `{"type":"stop_session"}`
-  - `{"type":"interrupt"}`
-
-Server -> Browser:
-- `{"type":"state","state":"idle|listening|thinking|speaking"}`
-- `{"type":"asr","text":"...","is_final":true|false}`
-- `{"type":"llm","text":"...","done":true|false}`
-- Binary frame: TTS PCM audio (24kHz mono 16-bit).
-
-## Audio Formats
-
-- Capture path: Browser microphone -> 16kHz PCM s16le mono -> Soniox ASR.
-- Synthesis path: Qwen TTS -> 24kHz PCM mono 16-bit -> browser resample -> speaker.
-
-## Interrupt / Barge-in Flow
-
-When a user interrupts during TTS playback, the pipeline:
-
-1. Calls `tts.cancel()` which sends `response.cancel` to DashScope then closes the WebSocket.
-2. The `on_close` callback puts `None` into `audio_queue`, signalling the async audio consumer to stop.
-3. The background TTS thread detects the `cancel_event` and exits without waiting for synthesis to finish.
-4. The pipeline cancels the turn task and transitions back to `listening`.
-
-This avoids orphaned threads, wasted DashScope synthesis, and stale audio data in the queue.
-
-## Design Trade-offs
-
-- DashScope realtime TTS SDK is synchronous, so backend uses a thread bridge instead of pure async API calls.
-- Soniox connection may be affected by system SOCKS proxy setup; ASR client retries with `proxy=None` fallback when needed.
-- TTS cancellation uses a shared `threading.Event` plus direct SDK calls (`cancel_response` / `close`) to coordinate across async and threaded code, since the sync SDK cannot be awaited.
+| Component | Technology |
+|-----------|-----------|
+| Server | FastAPI + WebSocket |
+| ASR | Soniox Realtime STT |
+| LLM | Any OpenAI-compatible API |
+| TTS | Qwen DashScope Realtime |
+| Frontend | Vanilla JS + Tailwind |
+| Transport | Single WebSocket (JSON + binary PCM) |
+| Identity | Markdown files (SOUL.md / USER.md / MEMORY.md) |
+| Skills | Agent Skills standard (SKILL.md) |
+| Tools | Python stdlib (+ optional browser-use) |

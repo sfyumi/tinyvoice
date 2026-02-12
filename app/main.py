@@ -1,4 +1,4 @@
-"""FastAPI app: serves static web UI and WebSocket voice pipeline."""
+"""FastAPI app: serves static web UI and WebSocket voice pipeline with agent capabilities."""
 
 from __future__ import annotations
 
@@ -12,18 +12,37 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.config import get_settings
+from app.memory import SoulManager
 from app.pipeline import Pipeline
+from app.skills import SkillManager
+from app.tools import create_default_registry
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 STATIC_DIR = ROOT_DIR / "static"
 
-app = FastAPI(title="TinyVoice")
+app = FastAPI(title="TinyAgent")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
-logger = logging.getLogger("tinyvoice.main")
+logger = logging.getLogger("tinyagent.main")
+
+# ---- Startup: discover skills ----
+_skill_manager: SkillManager | None = None
+
+
+@app.on_event("startup")
+async def _startup() -> None:
+    global _skill_manager
+    settings = get_settings()
+    skill_dirs = [ROOT_DIR / d for d in settings.get_skills_dirs()]
+    _skill_manager = SkillManager(skill_dirs=skill_dirs)
+    skills = _skill_manager.discover()
+    logger.info(
+        "Skills discovered: %s",
+        ", ".join(s.name for s in skills) if skills else "(none)",
+    )
 
 
 @app.get("/")
@@ -43,6 +62,25 @@ async def voice_ws(websocket: WebSocket) -> None:
     async def send_binary(payload: bytes) -> None:
         await websocket.send_bytes(payload)
 
+    # Each connection gets its own SkillManager (copy state from global)
+    skill_dirs = [ROOT_DIR / d for d in settings.get_skills_dirs()]
+    conn_skills = SkillManager(skill_dirs=skill_dirs)
+    conn_skills.discover()
+
+    # Soul manager for this connection
+    soul_mgr = SoulManager(soul_dir=ROOT_DIR / "soul")
+    soul_mgr.load()
+
+    # Create tool registry for this connection
+    tool_registry = create_default_registry(
+        skill_manager=conn_skills,
+        soul_manager=soul_mgr,
+        enabled_tools=settings.get_enabled_tools(),
+        allow_shell=settings.tools_allow_shell,
+        python_exec_enabled=settings.python_exec_enabled,
+        browser_enabled=settings.browser_enabled,
+    )
+
     pipeline = Pipeline(
         send_json=send_json,
         send_binary=send_binary,
@@ -55,6 +93,10 @@ async def voice_ws(websocket: WebSocket) -> None:
         tts_voice_id=settings.tts_voice_id,
         tts_model=settings.tts_model,
         tts_ws_url=settings.tts_ws_url,
+        skill_manager=conn_skills,
+        tool_registry=tool_registry,
+        soul_manager=soul_mgr,
+        max_tool_rounds=settings.agent_max_tool_rounds,
     )
 
     await send_json(
@@ -69,6 +111,9 @@ async def voice_ws(websocket: WebSocket) -> None:
             "soniox_ws_url": settings.soniox_ws_url,
             "tts_ws_url": settings.tts_ws_url,
             "llm_base_url": settings.llm_base_url,
+            "tools": tool_registry.tool_names,
+            "skills": conn_skills.to_info_dict(),
+            "soul": soul_mgr.to_info_dict(),
         }
     )
 
@@ -116,6 +161,14 @@ async def voice_ws(websocket: WebSocket) -> None:
             elif msg_type == "interrupt":
                 logger.info("Received control message: interrupt")
                 await pipeline.interrupt()
+            elif msg_type == "activate_skill":
+                skill_name = payload.get("name", "")
+                logger.info("Received control message: activate_skill %s", skill_name)
+                await pipeline.activate_skill(skill_name)
+            elif msg_type == "deactivate_skill":
+                skill_name = payload.get("name", "")
+                logger.info("Received control message: deactivate_skill %s", skill_name)
+                await pipeline.deactivate_skill(skill_name)
             else:
                 logger.warning("Received unknown control message type: %s", msg_type)
                 await send_json({"type": "error", "message": f"Unknown message type: {msg_type}"})
@@ -123,7 +176,6 @@ async def voice_ws(websocket: WebSocket) -> None:
         logger.info("WebSocketDisconnect exception")
         await pipeline.stop_session()
     except RuntimeError as exc:
-        # Starlette may raise this after disconnect if receive() is called again.
         logger.info("WebSocket closed runtime: %s", exc)
         await pipeline.stop_session()
     except Exception:

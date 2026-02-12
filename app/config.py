@@ -34,6 +34,17 @@ class Settings(BaseSettings):
     llm_api_key: str = Field(default="", alias="LLM_API_KEY")
     llm_model: str = Field(default="", alias="LLM_MODEL")
 
+    # Agent / Skills / Tools settings
+    skills_dirs: str = Field(default="skills", alias="SKILLS_DIRS")
+    tools_enabled: str = Field(
+        default="get_datetime,calculate,web_search,read_file,run_python,list_directory,search_files,list_skills,activate_skill,deactivate_skill",
+        alias="TOOLS_ENABLED",
+    )
+    agent_max_tool_rounds: int = Field(default=5, alias="AGENT_MAX_TOOL_ROUNDS")
+    tools_allow_shell: bool = Field(default=False, alias="TOOLS_ALLOW_SHELL")
+    python_exec_enabled: bool = Field(default=True, alias="PYTHON_EXEC_ENABLED")
+    browser_enabled: bool = Field(default=False, alias="BROWSER_ENABLED")
+
     def llm_configured(self) -> bool:
         return bool(self.llm_base_url and self.llm_api_key and self.llm_model)
 
@@ -42,6 +53,14 @@ class Settings(BaseSettings):
 
     def tts_configured(self) -> bool:
         return bool(self.dashscope_api_key and self.tts_voice_id)
+
+    def get_skills_dirs(self) -> list[str]:
+        """Parse comma-separated skills directories."""
+        return [d.strip() for d in self.skills_dirs.split(",") if d.strip()]
+
+    def get_enabled_tools(self) -> list[str]:
+        """Parse comma-separated enabled tools list."""
+        return [t.strip() for t in self.tools_enabled.split(",") if t.strip()]
 
 
 @lru_cache(maxsize=1)

@@ -8,7 +8,7 @@ from typing import Any
 import websockets
 from websockets.exceptions import ConnectionClosed
 
-logger = logging.getLogger("tinyvoice.asr")
+logger = logging.getLogger("tinyagent.asr")
 
 
 def _build_config(api_key: str, language_hints: list[str] | None = None) -> dict:

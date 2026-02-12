@@ -2,6 +2,7 @@ body {
   font-family: Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
 }
 
+/* ---- Chat Box ---- */
 .chat-box {
   height: calc(100vh - 220px);
   overflow-y: auto;
@@ -10,6 +11,7 @@ body {
   gap: 10px;
 }
 
+/* ---- Bubbles ---- */
 .bubble {
   max-width: 85%;
   border-radius: 14px;
@@ -18,6 +20,12 @@ body {
   white-space: pre-wrap;
   word-break: break-word;
   box-shadow: 0 1px 2px rgba(0, 0, 0, 0.06);
+  animation: bubbleIn 0.2s ease-out;
+}
+
+@keyframes bubbleIn {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
 }
 
 .bubble.user {
@@ -37,11 +45,76 @@ body {
   font-size: 12px;
 }
 
+/* Tool execution bubble */
+.bubble.tool {
+  align-self: flex-start;
+  background: linear-gradient(135deg, #f0f9ff 0%, #e8f4f8 100%);
+  border: 1px solid #bae6fd;
+  font-size: 12px;
+  color: #0369a1;
+  max-width: 75%;
+}
+
+.bubble.tool .tool-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+
+.bubble.tool .tool-spinner {
+  width: 12px;
+  height: 12px;
+  border: 2px solid #bae6fd;
+  border-top-color: #0284c7;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+.bubble.tool .tool-result {
+  margin-top: 4px;
+  padding-top: 4px;
+  border-top: 1px solid #bae6fd;
+  color: #334155;
+}
+
+.bubble.tool .tool-result.error {
+  color: #dc2626;
+}
+
+.bubble.tool .tool-done {
+  color: #059669;
+  font-weight: 600;
+}
+
+.bubble.tool .tool-time {
+  font-size: 10px;
+  color: #94a3b8;
+  margin-left: auto;
+}
+
+/* Skill activation bubble */
+.bubble.skill-change {
+  align-self: center;
+  background: linear-gradient(135deg, #faf5ff 0%, #f3e8ff 100%);
+  border: 1px solid #d8b4fe;
+  color: #7c3aed;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+/* ---- State Dot ---- */
 .state-dot {
   width: 10px;
   height: 10px;
   border-radius: 999px;
   display: inline-block;
+  transition: background-color 0.3s ease;
 }
 
 .state-dot.idle {
@@ -50,16 +123,30 @@ body {
 
 .state-dot.listening {
   background-color: #10b981;
+  animation: pulse 1.5s infinite;
 }
 
 .state-dot.thinking {
   background-color: #f59e0b;
+  animation: pulse 1s infinite;
+}
+
+.state-dot.executing {
+  background-color: #8b5cf6;
+  animation: pulse 0.6s infinite;
 }
 
 .state-dot.speaking {
   background-color: #3b82f6;
+  animation: pulse 2s infinite;
 }
 
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+
+/* ---- Diagnostics Panels ---- */
 .diagnostics details {
   border: 1px solid #e2e8f0;
   border-radius: 10px;
@@ -79,6 +166,8 @@ body {
   font-weight: 600;
   color: #334155;
   background: #f1f5f9;
+  display: flex;
+  align-items: center;
 }
 
 .diagnostics summary::-webkit-details-marker {
@@ -125,6 +214,7 @@ body {
   color: #475569;
 }
 
+/* ---- Connection Badges ---- */
 .conn-badge {
   border-radius: 999px;
   padding: 1px 8px;
@@ -161,6 +251,7 @@ body {
   color: #64748b;
 }
 
+/* ---- Stage Bar ---- */
 .stage-bar {
   width: 100%;
   height: 8px;
@@ -187,6 +278,120 @@ body {
   background: #3b82f6;
 }
 
+/* ---- Skills Panel ---- */
+.skill-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 8px;
+  border-radius: 8px;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.skill-item:hover {
+  background: #f1f5f9;
+  border-color: #cbd5e1;
+}
+
+.skill-item.active {
+  background: linear-gradient(135deg, #f0f9ff 0%, #eff6ff 100%);
+  border-color: #93c5fd;
+}
+
+.skill-item .skill-name {
+  font-weight: 600;
+  font-size: 12px;
+  color: #334155;
+}
+
+.skill-item .skill-desc {
+  font-size: 10px;
+  color: #64748b;
+  line-height: 1.3;
+  margin-top: 1px;
+}
+
+.skill-item .skill-toggle {
+  flex-shrink: 0;
+  width: 32px;
+  height: 18px;
+  border-radius: 999px;
+  background: #cbd5e1;
+  position: relative;
+  transition: background 0.2s ease;
+}
+
+.skill-item.active .skill-toggle {
+  background: #3b82f6;
+}
+
+.skill-item .skill-toggle::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: white;
+  transition: transform 0.2s ease;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.15);
+}
+
+.skill-item.active .skill-toggle::after {
+  transform: translateX(14px);
+}
+
+/* ---- Tool Log ---- */
+.tool-log-entry {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  padding: 4px 6px;
+  border-radius: 6px;
+  background: #f0f9ff;
+  border: 1px solid #e0f2fe;
+}
+
+.tool-log-entry.error {
+  background: #fef2f2;
+  border-color: #fecaca;
+}
+
+.tool-log-icon {
+  flex-shrink: 0;
+  width: 14px;
+  height: 14px;
+  margin-top: 1px;
+}
+
+.tool-log-body {
+  flex: 1;
+  min-width: 0;
+}
+
+.tool-log-name {
+  font-weight: 600;
+  color: #0369a1;
+}
+
+.tool-log-entry.error .tool-log-name {
+  color: #dc2626;
+}
+
+.tool-log-content {
+  color: #475569;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+
+/* ---- Responsive ---- */
 @media (max-width: 1024px) {
   .chat-box {
     height: calc(100vh - 420px);

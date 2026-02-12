@@ -8,3 +8,5 @@ pydantic-settings
 python-dotenv
 numpy
 python-socks
+pyyaml
+duckduckgo-search

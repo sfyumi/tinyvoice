@@ -1,4 +1,5 @@
-"""Session orchestrator: ASR -> LLM -> TTS with state machine and interruption."""
+"""Session orchestrator: ASR -> Agent (LLM+Tools) -> TTS with state machine and interruption."""
+
 from __future__ import annotations
 
 import asyncio
@@ -8,16 +9,20 @@ import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
+from app.agent import AgentEvent, AgentLoop
 from app.asr import SonioxASRClient
 from app.llm import LLMClient
+from app.memory import SoulManager
+from app.skills import SkillManager
+from app.tools import ToolRegistry
 from app.tts import TTSClient
 
 StateType = str
-logger = logging.getLogger("tinyvoice.pipeline")
+logger = logging.getLogger("tinyagent.pipeline")
 
 
 class Pipeline:
-    """Orchestrates per-connection real-time voice dialog."""
+    """Orchestrates per-connection real-time voice dialog with agent capabilities."""
 
     def __init__(
         self,
@@ -33,6 +38,10 @@ class Pipeline:
         tts_voice_id: str,
         tts_model: str,
         tts_ws_url: str,
+        skill_manager: SkillManager,
+        tool_registry: ToolRegistry,
+        soul_manager: SoulManager,
+        max_tool_rounds: int = 5,
     ) -> None:
         self._send_json = send_json
         self._send_binary = send_binary
@@ -48,6 +57,17 @@ class Pipeline:
             voice_id=tts_voice_id,
             ws_url=tts_ws_url,
         )
+        self._skills = skill_manager
+        self._tools = tool_registry
+        self._soul = soul_manager
+        self._agent = AgentLoop(
+            llm=self._llm,
+            tools=self._tools,
+            skills=self._skills,
+            soul=self._soul,
+            max_rounds=max_tool_rounds,
+        )
+        self._completed_turns: int = 0
         self._audio_queue: asyncio.Queue[bytes | None] = asyncio.Queue()
         self._state: StateType = "idle"
         self._running = False
@@ -59,6 +79,7 @@ class Pipeline:
         self._last_endpoint_at: float = 0.0
         self._current_turn_id: str | None = None
         self._listening_started_at: float = 0.0
+        self._cancel_event: asyncio.Event = asyncio.Event()
 
     async def _set_state(self, state: StateType) -> None:
         self._state = state
@@ -85,12 +106,19 @@ class Pipeline:
             return
         logger.info("Starting pipeline session")
         self._running = True
+        self._cancel_event.clear()
         self._session_task = asyncio.create_task(self._session_loop())
 
     async def stop_session(self) -> None:
         logger.info("Stopping pipeline session")
         self._running = False
+        self._cancel_event.set()
         await self._tts.cancel()
+
+        # Generate session memory summary if there were completed turns
+        if self._completed_turns > 0:
+            await self._save_session_memory()
+
         await self._send_connection_status("asr", "disconnected")
         await self._send_connection_status("tts", "idle")
         await self._send_connection_status("llm", "disconnected")
@@ -104,9 +132,37 @@ class Pipeline:
             except asyncio.CancelledError:
                 pass
 
+    async def _save_session_memory(self) -> None:
+        """Generate a summary of this session and append to MEMORY.md."""
+        try:
+            # Get conversation history from LLM client
+            history = self._llm._history
+            if not history:
+                return
+
+            # Build a simple summary from the conversation
+            user_messages = [m["content"] for m in history if m.get("role") == "user" and m.get("content")]
+            assistant_messages = [m["content"] for m in history if m.get("role") == "assistant" and m.get("content")]
+
+            if not user_messages:
+                return
+
+            # Create a concise summary
+            topics = "; ".join(msg[:80] for msg in user_messages[:5])
+            summary = f"对话 ({self._completed_turns} 轮): 用户问了 {topics}"
+            if assistant_messages:
+                last_reply = assistant_messages[-1][:100]
+                summary += f"。最后的回复涉及: {last_reply}"
+
+            self._soul.append_memory(summary)
+            logger.info("Session memory saved (%d turns)", self._completed_turns)
+        except Exception:
+            logger.exception("Failed to save session memory")
+
     async def interrupt(self) -> None:
-        logger.info("Interrupt requested")
-        if self._state == "speaking" and self._turn_task and not self._turn_task.done():
+        logger.info("Interrupt requested (state=%s)", self._state)
+        if self._state in ("speaking", "executing") and self._turn_task and not self._turn_task.done():
+            self._cancel_event.set()
             await self._tts.cancel()
             self._turn_task.cancel()
         if self._running:
@@ -116,9 +172,40 @@ class Pipeline:
         if self._running:
             await self._audio_queue.put(chunk)
 
+    async def activate_skill(self, name: str) -> bool:
+        """Activate a skill and broadcast the update."""
+        ok = self._skills.activate(name)
+        if ok:
+            await self._send_json({
+                "type": "skill",
+                "event": "activated",
+                "name": name,
+                "skills": self._skills.to_info_dict(),
+            })
+        return ok
+
+    async def deactivate_skill(self, name: str) -> bool:
+        """Deactivate a skill and broadcast the update."""
+        ok = self._skills.deactivate(name)
+        if ok:
+            await self._send_json({
+                "type": "skill",
+                "event": "deactivated",
+                "name": name,
+                "skills": self._skills.to_info_dict(),
+            })
+        return ok
+
     async def _session_loop(self) -> None:
         logger.info("Session loop started")
         await self._set_state("listening")
+
+        # Broadcast available skills at session start
+        await self._send_json({
+            "type": "skills_list",
+            "skills": self._skills.to_info_dict(),
+        })
+
         try:
             await self._asr.connect()
             logger.info("ASR connected")
@@ -188,6 +275,7 @@ class Pipeline:
                         "text": sentence,
                     }
                 )
+                self._cancel_event.clear()
                 self._turn_task = asyncio.create_task(self._run_turn(turn_id, sentence))
                 try:
                     await self._turn_task
@@ -229,11 +317,52 @@ class Pipeline:
         llm_last_token_at: float | None = None
         tts_first_audio_at: float | None = None
         llm_token_count = 0
+        tool_calls_count = 0
 
-        async def llm_text_stream() -> AsyncIterator[str]:
+        # Agent event callback: forward events to WebSocket
+        async def on_agent_event(event: AgentEvent) -> None:
+            nonlocal tool_calls_count
+            if event.type == "tool_start":
+                tool_calls_count += 1
+                await self._set_state("executing")
+                await self._send_json({
+                    "type": "tool",
+                    "event": "start",
+                    "turn_id": turn_id,
+                    "name": event.data.get("name", ""),
+                    "arguments": event.data.get("arguments", {}),
+                })
+            elif event.type == "tool_result":
+                await self._send_json({
+                    "type": "tool",
+                    "event": "result",
+                    "turn_id": turn_id,
+                    "name": event.data.get("name", ""),
+                    "content": event.data.get("content", ""),
+                    "is_error": event.data.get("is_error", False),
+                    "elapsed_ms": event.data.get("elapsed_ms", 0),
+                })
+                # Back to thinking after tool result (may loop again)
+                await self._set_state("thinking")
+            elif event.type == "skill_changed":
+                await self._send_json({
+                    "type": "skill",
+                    "event": event.data.get("action", "changed"),
+                    "name": event.data.get("skill_name", ""),
+                    "skills": event.data.get("skills", []),
+                })
+            elif event.type == "thinking":
+                await self._set_state("thinking")
+
+        # Run the agent loop -- yields text tokens for TTS
+        async def agent_text_stream() -> AsyncIterator[str]:
             nonlocal llm_first_token_at, llm_last_token_at, llm_token_count
             try:
-                async for token in self._llm.stream_chat(user_text):
+                async for token in self._agent.run_turn(
+                    user_text,
+                    on_event=on_agent_event,
+                    cancel_event=self._cancel_event,
+                ):
                     llm_token_count += 1
                     now = time.monotonic()
                     if llm_first_token_at is None:
@@ -251,7 +380,10 @@ class Pipeline:
                         }
                     )
                     yield token
-                logger.info("LLM stream finished [turn_id=%s], tokens=%s", turn_id, llm_token_count)
+                logger.info(
+                    "Agent stream finished [turn_id=%s], tokens=%s, tool_calls=%s",
+                    turn_id, llm_token_count, tool_calls_count,
+                )
                 await self._send_json(
                     {
                         "type": "llm",
@@ -267,13 +399,13 @@ class Pipeline:
                     }
                 )
             except Exception as exc:
-                logger.exception("LLM stream failed [turn_id=%s]", turn_id)
+                logger.exception("Agent stream failed [turn_id=%s]", turn_id)
                 await self._send_connection_status("llm", "error", f"{type(exc).__name__}: {exc}")
                 await self._send_json(
                     {
                         "type": "error",
                         "turn_id": turn_id,
-                        "message": f"LLM failed: {type(exc).__name__}: {exc}",
+                        "message": f"Agent failed: {type(exc).__name__}: {exc}",
                     }
                 )
                 raise
@@ -283,7 +415,7 @@ class Pipeline:
         audio_bytes = 0
         try:
             await self._send_connection_status("tts", "connected")
-            async for pcm in self._tts.stream_speech(llm_text_stream()):
+            async for pcm in self._tts.stream_speech(agent_text_stream()):
                 audio_chunks += 1
                 audio_bytes += len(pcm)
                 if tts_first_audio_at is None:
@@ -343,8 +475,10 @@ class Pipeline:
                     "tts_audio_chunks": audio_chunks,
                     "tts_est_duration_ms": tts_est_duration_ms,
                     "turn_total_ms": int(max(0.0, turn_finished_at - turn_started_at) * 1000),
+                    "tool_calls": tool_calls_count,
                 }
             )
             await self._send_json({"type": "turn", "event": "finished", "turn_id": turn_id})
+            self._completed_turns += 1
         if self._running:
             await self._set_state("listening")
