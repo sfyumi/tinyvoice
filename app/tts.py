@@ -14,7 +14,7 @@ from dashscope.audio.qwen_tts_realtime import (
     QwenTtsRealtimeCallback,
 )
 
-logger = logging.getLogger("tinyvoice.tts")
+logger = logging.getLogger("tinyagent.tts")
 
 
 class _TTSCallback(QwenTtsRealtimeCallback):

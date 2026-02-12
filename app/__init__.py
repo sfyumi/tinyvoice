@@ -1,1 +1,1 @@
-"""TinyVoice package."""
+"""TinyAgent package."""

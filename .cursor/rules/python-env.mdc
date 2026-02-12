@@ -1,0 +1,26 @@
+---
+description: Python environment and package installation rules for this project
+alwaysApply: true
+---
+
+# Python Environment Rules
+
+## Virtual Environment
+- Always use the project's `.venv` virtual environment: `source .venv/bin/activate`
+- Never install packages globally or with `--break-system-packages`.
+
+## Package Installation (China Mirror)
+- Always use the Tsinghua PyPI mirror for pip installs to avoid SSL/network issues:
+  ```bash
+  pip install -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple <package>
+  ```
+- For requirements.txt:
+  ```bash
+  pip install -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple -r requirements.txt
+  ```
+
+## Checklist
+
+- Always use `-i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple` flag
+- Always activate `.venv` before running pip
+- After installing, add the package to `requirements.txt`

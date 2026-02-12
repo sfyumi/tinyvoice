@@ -3,19 +3,19 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>TinyVoice - 实时语音对话</title>
+    <title>TinyAgent - AI 语音智能体</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link rel="stylesheet" href="/static/style.css" />
   </head>
   <body class="bg-slate-100 text-slate-800">
-    <div class="mx-auto flex min-h-screen w-full max-w-5xl flex-col p-4">
+    <div class="mx-auto flex min-h-screen w-full max-w-6xl flex-col p-4">
       <header class="mb-4 rounded-xl bg-white p-4 shadow-sm">
         <div class="flex items-center justify-between">
           <div>
-            <h1 class="text-xl font-semibold">TinyVoice 语音 Agent</h1>
-            <p class="text-sm text-slate-500">ASR → LLM → TTS 实时对话</p>
+            <h1 class="text-xl font-semibold">Tiny<span class="text-blue-600">Agent</span></h1>
+            <p class="text-sm text-slate-500">ASR &rarr; Agent (LLM + Tools + Skills) &rarr; TTS</p>
           </div>
-          <div class="flex items-center gap-2">
+          <div class="flex items-center gap-3">
             <span id="stateDot" class="state-dot idle"></span>
             <span id="stateText" class="text-sm font-medium">idle</span>
           </div>
@@ -23,42 +23,84 @@
       </header>
 
       <main class="grid flex-1 grid-cols-1 gap-4 lg:grid-cols-[2fr_1fr]">
-        <section class="rounded-xl bg-white p-4 shadow-sm">
-          <div id="chat" class="chat-box"></div>
+        <section class="flex flex-col gap-4">
+          <!-- Chat panel -->
+          <div class="rounded-xl bg-white p-4 shadow-sm flex-1">
+            <div id="chat" class="chat-box"></div>
+          </div>
         </section>
 
-        <aside class="rounded-xl bg-white p-4 shadow-sm">
+        <aside class="rounded-xl bg-white p-4 shadow-sm overflow-y-auto" style="max-height: calc(100vh - 120px);">
           <div class="space-y-3 diagnostics">
+
+            <!-- Controls -->
             <details open>
               <summary>控制</summary>
               <div class="mt-3 space-y-3">
                 <button
                   id="startBtn"
-                  class="w-full rounded-lg bg-blue-600 px-4 py-2 font-medium text-white hover:bg-blue-700"
+                  class="w-full rounded-lg bg-blue-600 px-4 py-2 font-medium text-white hover:bg-blue-700 transition-colors"
                 >
                   开始会话
                 </button>
                 <button
                   id="stopBtn"
-                  class="w-full rounded-lg bg-slate-700 px-4 py-2 font-medium text-white hover:bg-slate-800"
+                  class="w-full rounded-lg bg-slate-700 px-4 py-2 font-medium text-white hover:bg-slate-800 transition-colors"
                 >
                   结束会话
                 </button>
                 <button
                   id="interruptBtn"
-                  class="w-full rounded-lg bg-amber-500 px-4 py-2 font-medium text-white hover:bg-amber-600"
+                  class="w-full rounded-lg bg-amber-500 px-4 py-2 font-medium text-white hover:bg-amber-600 transition-colors"
                 >
                   打断播报
                 </button>
                 <div>
                   <label class="mb-1 block text-sm text-slate-600">麦克风电平</label>
                   <div class="h-2 w-full rounded-full bg-slate-200">
-                    <div id="levelBar" class="h-2 rounded-full bg-emerald-500" style="width: 0%"></div>
+                    <div id="levelBar" class="h-2 rounded-full bg-emerald-500 transition-all" style="width: 0%"></div>
                   </div>
                 </div>
               </div>
             </details>
 
+            <!-- Skills Panel -->
+            <details open>
+              <summary>
+                <span>技能 Skills</span>
+                <span id="skillCount" class="ml-2 text-xs font-normal text-slate-400">0 可用</span>
+              </summary>
+              <div class="mt-3">
+                <div id="skillsList" class="space-y-2 text-sm">
+                  <div class="text-xs text-slate-400">等待连接...</div>
+                </div>
+              </div>
+            </details>
+
+            <!-- Soul & Memory -->
+            <details open>
+              <summary>
+                <span>灵魂 Soul</span>
+                <span id="soulStatus" class="ml-2 text-xs font-normal text-slate-400"></span>
+              </summary>
+              <div class="mt-3 space-y-2 text-sm">
+                <div class="metric-row"><span>SOUL.md</span><span id="soulLoaded" class="text-xs">-</span></div>
+                <div class="metric-row"><span>USER.md</span><span id="userLoaded" class="text-xs">-</span></div>
+                <div class="metric-row"><span>记忆条目</span><span id="memoryEntries" class="text-xs">0</span></div>
+              </div>
+            </details>
+
+            <!-- Tool Activity -->
+            <details open>
+              <summary>工具调用</summary>
+              <div class="mt-3">
+                <div id="toolLog" class="space-y-1 text-xs max-h-40 overflow-y-auto">
+                  <div class="text-slate-400">暂无工具调用</div>
+                </div>
+              </div>
+            </details>
+
+            <!-- Latency -->
             <details open>
               <summary>延迟指标（上一轮）</summary>
               <div class="mt-3 space-y-2 text-sm">
@@ -82,6 +124,7 @@
               </div>
             </details>
 
+            <!-- Current Turn -->
             <details open>
               <summary>当前 Turn</summary>
               <div class="mt-3 space-y-2 text-sm">
@@ -90,9 +133,11 @@
                 <div class="metric-row"><span>TTS Chunks</span><span id="liveTtsChunks">0</span></div>
                 <div class="metric-row"><span>估算音频</span><span id="liveTtsDuration">0 ms</span></div>
                 <div class="metric-row"><span>Listening 时长</span><span id="liveListeningDuration">0 ms</span></div>
+                <div class="metric-row"><span>工具调用次数</span><span id="liveToolCalls">0</span></div>
               </div>
             </details>
 
+            <!-- Connection Status -->
             <details open>
               <summary>连接状态</summary>
               <div class="mt-3 space-y-2 text-sm">
@@ -104,6 +149,7 @@
               </div>
             </details>
 
+            <!-- Session Stats -->
             <details open>
               <summary>会话统计</summary>
               <div class="mt-3 space-y-2 text-sm">
@@ -112,9 +158,11 @@
                 <div class="metric-row"><span>平均端到端</span><span id="sessionAvgE2E">-</span></div>
                 <div class="metric-row"><span>总 LLM Tokens</span><span id="sessionTokens">0</span></div>
                 <div class="metric-row"><span>总 TTS 音频</span><span id="sessionTtsDuration">0 ms</span></div>
+                <div class="metric-row"><span>总工具调用</span><span id="sessionToolCalls">0</span></div>
               </div>
             </details>
 
+            <!-- Config -->
             <details>
               <summary>配置信息</summary>
               <div class="mt-3 space-y-2 text-xs text-slate-600">
@@ -127,6 +175,7 @@
                 <div class="metric-row"><span>ASR Config</span><span id="cfgAsrReady">-</span></div>
                 <div class="metric-row"><span>LLM Config</span><span id="cfgLlmReady">-</span></div>
                 <div class="metric-row"><span>TTS Config</span><span id="cfgTtsReady">-</span></div>
+                <div class="metric-row"><span>工具列表</span><span id="cfgTools">-</span></div>
               </div>
             </details>
           </div>

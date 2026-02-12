@@ -22,8 +22,10 @@ htmlcov/
 
 # IDE / OS files
 .DS_Store
+**/.DS_Store
 .idea/
 .vscode/
+.cursor/plans/
 
 # Logs
 *.log
